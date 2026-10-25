@@ -34,6 +34,7 @@ import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.unit.dp
 import com.duoopen.fold.HingeAngleSource
+import com.duoopen.fold.HingeProfile
 import com.duoopen.settings.DuoConfig
 import com.duoopen.settings.DuoSettings
 import kotlinx.coroutines.delay
@@ -265,7 +266,7 @@ fun ControlSheet(
                     "Shizuku mode (optional)",
                     "Shizuku gives apps ADB-level helpers without root. With it, Duo Open captures the screen " +
                         "with no rate limit and keeps the picture under the frost live, and on Samsung foldables " +
-                        "reads the real hinge angle instead of just 0° / 90° / 180°.",
+                        "reads the real hinge angle (from the system's own sensor log) instead of just 0° / 90° / 180°.",
                 )
                 Hint(shizukuStatus, warn = !shizukuReady)
                 Spacer(Modifier.height(6.dp))
@@ -291,15 +292,17 @@ fun ControlSheet(
                         Column(Modifier.weight(1f)) {
                             Text("Continuous hinge angle (Samsung)", style = MaterialTheme.typography.titleSmall)
                             Hint(
-                                if (foldWallpaperActive) "Samsung's Fold interactive wallpaper is set — the real angle is read from it. " + angleFeedStatus()
-                                else "Needs Samsung's built-in “Fold interactive” wallpaper as the home wallpaper (it's what receives the real angle). Set it, then come back.",
-                                warn = !foldWallpaperActive,
+                                "Samsung's own hinge sensors are read from the system log: a reading every ~5°, tracked in between, " +
+                                    "nothing to set up. " +
+                                    (if (foldWallpaperActive) "The Fold interactive wallpaper is set too, so 1° readings come from it while it's visible. "
+                                    else "Optional extra: Samsung's built-in “Fold interactive” wallpaper as the home wallpaper adds 1° readings while it's visible. ") +
+                                    angleFeedStatus(),
                             )
                         }
                         Switch(checked = config.shizukuAngle, onCheckedChange = { v -> DuoSettings.update { it.copy(shizukuAngle = v) } })
                     }
                     if (!foldWallpaperActive) {
-                        TextButton(onClick = onOpenWallpaperSettings) { Text("Open wallpaper settings") }
+                        TextButton(onClick = onOpenWallpaperSettings) { Text("Open wallpaper settings (optional)") }
                     }
                 }
             }
@@ -320,15 +323,17 @@ fun ControlSheet(
             Divider()
             Section("Hinge sensor", "Diagnostics. Nothing here changes the look.")
             Hint(sensorStatus)
-            if (hasSensor && hinge.isCoarse) {
+            if (hasSensor && hinge.stopsOnly) {
                 Hint(
-                    "This sensor only reports 0°, 90° and 180° (the continuous one is locked to system apps on " +
-                        "Galaxy Z Fold 7 and earlier), so the fold plays as a short animation at each stop instead of " +
-                        "tracking your hand.",
+                    "This sensor only reports 0°, 90° and 180° (Samsung locks the continuous one to system apps), so the " +
+                        "fold plays as a short animation at each stop instead of tracking your hand" +
+                        (if (hinge.posture != null) ", helped by the system's fold posture (opening is noticed before the first 90°)" else "") +
+                        ". Shizuku mode above reads the real angle.",
                     warn = true,
                 )
             }
             Hint("Hinge ${if (hingeAngle.isNaN()) "—" else "${hingeAngle.roundToInt()}°"}  ·  pane tilt %.1f°".format(paneTilt))
+            Hint("Learned: ${HingeProfile.summary()}.")
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
                     Text("Simulate the hinge", style = MaterialTheme.typography.titleSmall)
@@ -346,8 +351,13 @@ fun ControlSheet(
                     range = 60f..180f,
                 )
             }
-            TextButton(onClick = { clipboard.setText(AnnotatedString(hinge.report())) }) {
-                Text("Copy sensor report for a bug report")
+            Row {
+                TextButton(onClick = { clipboard.setText(AnnotatedString(hinge.report())) }) {
+                    Text("Copy sensor report")
+                }
+                TextButton(onClick = { HingeProfile.reset() }) {
+                    Text("Forget learned angles")
+                }
             }
         }
     }

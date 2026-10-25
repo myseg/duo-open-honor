@@ -18,7 +18,6 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.function.Consumer
 import java.util.function.ObjIntConsumer
-import java.util.regex.Pattern
 
 /**
  * Runs in a process Shizuku spawns with ADB (shell) privileges. Two jobs the
@@ -28,14 +27,16 @@ import java.util.regex.Pattern
  *    hidden `IWindowManager.captureDisplay`, with our own overlay layers
  *    excluded — so the fold can re-capture the live screen while it plays.
  * 2. **Samsung's continuous hinge angle.** Only Samsung's own components get
- *    the real angle; its "Fold interactive" home wallpaper logs it on every
- *    wallpaper command it receives (`mCurrentAngle=…`), and the shell user may
- *    read logcat. The app pings the wallpaper; this tails the log and calls
+ *    the real angle, but the shell user may read logcat, and two of them log
+ *    it: the sensor HAL writes every 10–11° step of its hinge sensors (found
+ *    by Duo Open for Galaxy, github.com/OrangeHubX/duo-open-for-galaxy, MIT),
+ *    and the "Fold interactive" home wallpaper logs `mCurrentAngle=…` on every
+ *    wallpaper command it receives (found by Duo Fold Live,
+ *    github.com/joeconsorti/duo-fold-live, MIT). This tails both and calls
  *    back with each fresh value.
  *
- * Both techniques were worked out by Duo Fold Live
- * (github.com/joeconsorti/duo-fold-live, MIT) — the capture-API resolution
- * and the wallpaper log format in particular follow their findings.
+ * The capture technique and the capture-API resolution follow Duo Fold
+ * Live's findings as well.
  *
  * Nothing here is reachable without the user authorising this app in
  * Shizuku, and every transaction checks the calling uid.
@@ -223,13 +224,13 @@ class DuoShellService : Binder() {
         }
     }
 
-    // ---- Samsung wallpaper angle reader -------------------------------------
+    // ---- Samsung hinge angle reader ------------------------------------------
 
     /**
-     * Tails logcat for the "Fold interactive" wallpaper's command log. Each
-     * command the app sends makes the wallpaper log a line containing the
-     * action it was sent, whether it's visible, and `mCurrentAngle=<deg>`.
-     * Log format per Duo Fold Live's findings.
+     * Tails logcat for the lines Samsung's sensor HAL and Fold interactive
+     * wallpaper write about the hinge (see [SamsungHingeLog]) and calls each
+     * accepted reading back with its source, so the app can prefer the finer
+     * one when both speak.
      */
     private class AngleReader(private val action: String, private val callback: IBinder) {
         @Volatile private var process: java.lang.Process? = null
@@ -238,6 +239,8 @@ class DuoShellService : Binder() {
         private var lines = 0
         private var parsed = 0
         private var rejected = 0
+        private var halLines = 0
+        private var wallpaperLines = 0
         private var lastAngle = Float.NaN
         private var lastUptime = 0L
 
@@ -246,7 +249,7 @@ class DuoShellService : Binder() {
                 var child: java.lang.Process? = null
                 try {
                     child = ProcessBuilder(
-                        "logcat", "-v", "epoch", "-T", "1", "-s", "SprWallpaper|FoldInteractive:V", "*:S",
+                        listOf("logcat", "-v", "epoch", "-T", "1", "-s") + SamsungHingeLog.LOGCAT_FILTERS,
                     ).redirectErrorStream(true).start()
                     process = child
                     state = "listening"
@@ -254,7 +257,10 @@ class DuoShellService : Binder() {
                         while (!stopped) {
                             val line = input.readLine() ?: break
                             lines++
-                            val value = parse(line) ?: continue
+                            val reading = SamsungHingeLog.parse(line, action) ?: continue
+                            val value = reading.angle
+                            val source = reading.source
+                            val halTs = reading.halTimestampNs
                             // Never treat a buffered line as current.
                             val epoch = line.trim().split(Regex("\\s+"), 2).firstOrNull()?.toDoubleOrNull()
                             val age = if (epoch == null) Long.MAX_VALUE else System.currentTimeMillis() - (epoch * 1000).toLong()
@@ -263,14 +269,18 @@ class DuoShellService : Binder() {
                                 continue
                             }
                             parsed++
-                            lastAngle = value
-                            lastUptime = SystemClock.uptimeMillis() - age.coerceAtLeast(0)
+                            if (source == ShellProtocol.SOURCE_WALLPAPER) wallpaperLines++ else halLines++
+                            if (source != ShellProtocol.SOURCE_UNSHUT) lastAngle = value
+                            // The HAL stamps each reading with when it was sampled.
+                            val sensorAge = if (halTs > 0) (SystemClock.elapsedRealtimeNanos() - halTs) / 1_000_000 else -1
+                            lastUptime = SystemClock.uptimeMillis() - (if (sensorAge in 0..1500) sensorAge else age.coerceAtLeast(0))
                             state = "receiving"
                             val p = Parcel.obtain()
                             try {
                                 p.writeInterfaceToken(ShellProtocol.CALLBACK_TOKEN)
                                 p.writeFloat(value)
                                 p.writeLong(lastUptime)
+                                p.writeInt(source)
                                 callback.transact(ShellProtocol.CB_ANGLE, p, null, IBinder.FLAG_ONEWAY)
                             } catch (e: Exception) {
                                 state = "callback gone: ${e.message}"
@@ -302,22 +312,10 @@ class DuoShellService : Binder() {
             putInt("lines", lines)
             putInt("parsed", parsed)
             putInt("rejected", rejected)
+            putInt("hal", halLines)
+            putInt("wallpaper", wallpaperLines)
             putFloat("angle", lastAngle)
             putLong("last", lastUptime)
-        }
-
-        private fun parse(line: String): Float? {
-            if (!line.contains("SprWallpaper|FoldInteractive") || !line.contains("onCommand:")) return null
-            if (!(line.contains("action=$action,") || line.contains("action[$action]"))) return null
-            if (!(line.contains("isVisible=true") || line.contains("isVisible[true]"))) return null
-            val m = ANGLE.matcher(line)
-            if (!m.find()) return null
-            val v = m.group(1)?.toFloatOrNull() ?: return null
-            return if (v in 0f..180f) v else null
-        }
-
-        private companion object {
-            val ANGLE: Pattern = Pattern.compile("mCurrentAngle(?:=|\\[)([0-9]+(?:\\.[0-9]+)?)")
         }
     }
 

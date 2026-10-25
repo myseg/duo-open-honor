@@ -167,24 +167,32 @@ object ShizukuBridge {
         return b.getParcelable("bitmap")
     }
 
-    /** Receives angles from the shell-side wallpaper log reader. */
-    private class AngleCallback(private val onAngle: (Float) -> Unit) : Binder() {
+    /** Receives readings from the shell-side hinge log reader. */
+    private class AngleCallback(private val onAngle: (angle: Float, sampleUptimeMs: Long, source: Int) -> Unit) : Binder() {
         init { attachInterface(null, ShellProtocol.CALLBACK_TOKEN) }
         override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
             if (code != ShellProtocol.CB_ANGLE) return super.onTransact(code, data, reply, flags)
             data.enforceInterface(ShellProtocol.CALLBACK_TOKEN)
-            onAngle(data.readFloat())
+            val angle = data.readFloat()
+            val at = data.readLong()
+            val source = data.readInt()
+            onAngle(angle, at, source)
             return true
         }
     }
 
     private var angleCallback: AngleCallback? = null
 
-    fun startAngles(action: String, onAngle: (Float) -> Unit): Boolean {
+    /**
+     * Starts the hinge log reader. [wallpaperAction] is the wallpaper command
+     * the app will ping Samsung's fold wallpaper with (empty: don't parse the
+     * wallpaper's log).
+     */
+    fun startAngles(wallpaperAction: String, onAngle: (angle: Float, sampleUptimeMs: Long, source: Int) -> Unit): Boolean {
         val cb = AngleCallback(onAngle)
         angleCallback = cb
         return call(ShellProtocol.START_ANGLES) { p ->
-            p.writeString(action)
+            p.writeString(wallpaperAction)
             p.writeStrongBinder(cb)
         } != null
     }

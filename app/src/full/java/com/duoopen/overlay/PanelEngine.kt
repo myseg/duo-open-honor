@@ -56,6 +56,8 @@ class PanelEngine(
     private val onShowingChanged: () -> Unit,
     /** Last capture of each panel kind, shared by all engines (see [SnapshotCache]). */
     private val cache: SnapshotCache,
+    /** This display switched on while the service was already running (not a startup sync). */
+    private val justLit: Boolean = false,
 ) {
     private enum class Phase { IDLE, CAPTURING, SHOWING }
 
@@ -88,6 +90,18 @@ class PanelEngine(
     private var bridging = false
     /** Live re-capture loop (Shizuku mode) is scheduled. */
     private var liveLoop = false
+    /**
+     * Hinge angle at which this display took over the inner panel this fold
+     * (NaN: unknown — use the learned swap angle). The inner picture is fully
+     * frosted right there, wherever "there" turned out to be, and clears from
+     * it, so it never pops in half-cleared.
+     */
+    private var innerFullAt = Float.NaN
+    /** The overlay was dropped because the hinge paused mid-fold; it comes back once the hinge moves on. */
+    private var stalled = false
+    private var stallAngle = Float.NaN
+    /** Estimate at the last settle check, so a slow continuous source counts as motion. */
+    private var lastSettleEstimate = Float.NaN
 
     val showing: Boolean get() = phase == Phase.SHOWING
 
@@ -95,8 +109,16 @@ class PanelEngine(
         override fun run() {
             val o = surface ?: return
             if (o.tilt < DuoShader.FLAT_EPSILON) return
+            // A sparse source (Samsung's HAL log: a reading every ~5°) can go
+            // half a second between readings on a slow fold while the tracked
+            // estimate keeps moving; that is motion too.
+            val est = hinge.estimate()
+            if (est.isFinite() && lastSettleEstimate.isFinite() && kotlin.math.abs(est - lastSettleEstimate) > 0.3f) {
+                lastHingeMoveMs = SystemClock.uptimeMillis()
+            }
+            lastSettleEstimate = est
             if (!demoRunning && SystemClock.uptimeMillis() - lastHingeMoveMs >= SETTLE_TIMEOUT_MS) {
-                dismiss(fadeMs = FADE_OUT_STALLED_MS)
+                stall()
             } else {
                 handler.postDelayed(this, 100)
             }
@@ -105,7 +127,19 @@ class PanelEngine(
 
     /** A timed frost-up that no panel swap has replaced: the fold stalled, let the live screen through. */
     private val peakHold = Runnable {
-        if (timedResolve && !demoRunning) dismiss(fadeMs = FADE_OUT_STALLED_MS)
+        if (timedResolve && !demoRunning) stall()
+    }
+
+    /**
+     * The hinge paused mid-fold (tent / flex): drop the overlay so the live
+     * screen shows, but remember where, so the fold resumes — with a fresh
+     * capture — once the hinge moves on by [STALL_RESUME_DEG].
+     */
+    private fun stall() {
+        stalled = true
+        stallAngle = hinge.lastAngle
+        Log.i(TAG, "display $displayId: stalled at hinge=${hinge.lastAngle}")
+        dismiss(fadeMs = FADE_OUT_STALLED_MS)
     }
 
     init {
@@ -114,7 +148,13 @@ class PanelEngine(
         val tilt = currentTilt()
         panelSwitched = tilt >= DuoShader.FLAT_EPSILON
         restArmed = !panelSwitched
-        Log.i(TAG, "engine display=$displayId inner=$innerPanel midFold=$panelSwitched")
+        if (panelSwitched && innerPanel && hinge.canFollow) {
+            // A separate inner display that lit mid-fold (phones that keep both
+            // panels on): this is where the cover hands over.
+            innerFullAt = hinge.lastAngle
+            if (justLit) hinge.learnSwap(hinge.lastAngle)
+        }
+        Log.i(TAG, "engine display=$displayId inner=$innerPanel midFold=$panelSwitched justLit=$justLit")
     }
 
     /** Whether this cover panel is lit alongside an inner panel (no swap will hand over). */
@@ -123,21 +163,46 @@ class PanelEngine(
     private fun tiltFor(angle: Float): Float {
         if (angle.isNaN()) return 0f
         val config = DuoSettings.config.value
-        return when {
-            innerPanel -> DuoShader.tiltForHinge(angle, config)
-            concurrentCover() -> DuoShader.concurrentCoverTiltForHinge(angle, config)
-            else -> DuoShader.coverTiltForHinge(angle, config)
+        val swap = hinge.panelSwapHinge
+        return if (innerPanel) {
+            DuoShader.tiltForHinge(angle, config, innerFullAt.takeIf { it.isFinite() } ?: swap)
+        } else {
+            // One curve whether or not the inner panel is lit alongside: it
+            // must not jump when the inner panel switches on or off.
+            DuoShader.coverTiltForHinge(angle, config, swap, staysLit = concurrentCover())
         }
     }
 
     private fun currentTilt(): Float = tiltFor(hinge.lastAngle)
 
+    /** Follow the hinge every frame: the lead on a fine sensor, the tracked glide between a sparse source's readings. */
+    private fun followHinge(f: TiltFollower) {
+        f.tauS = if (hinge.externalActive) TiltFollower.FOLLOW_TAU_S else TiltFollower.DEFAULT_TAU_S
+        f.follow { now -> tiltFor(hinge.estimate(now)) }
+    }
+
     fun onHinge(angle: Float) {
         lastHingeMoveMs = SystemClock.uptimeMillis()
         evaluate()
         val tilt = tiltFor(angle)
+        val f = follower
+        if (timedResolve && hinge.externalActive && phase == Phase.SHOWING && !demoRunning && f != null &&
+            (innerPanel || concurrentCover())
+        ) {
+            // A continuous angle (Shizuku) arrived mid-ease: follow the hand from here.
+            Log.i(TAG, "display $displayId: continuous angle $angle mid-ease; following")
+            timedResolve = false
+            handler.removeCallbacks(peakHold)
+            handler.removeCallbacks(settleCheck)
+            handler.postDelayed(settleCheck, SETTLE_TIMEOUT_MS)
+        }
         if (tilt < DuoShader.FLAT_EPSILON && phase == Phase.SHOWING && !demoRunning) {
-            val f = follower
+            if (timedResolve && f != null && f.target < DuoShader.FLAT_EPSILON) {
+                // Already easing out to flat on a timer (cover after a close);
+                // a "shut" from the posture or hall sensor mustn't cut it short.
+                // The follower dismisses at flat.
+                return
+            }
             if (timedResolve && hinge.isCoarse && f != null && f.current > DuoShader.FLAT_EPSILON) {
                 // Stops-only sensor: the rest stop (180° / 0°) is the first news
                 // that the fold has finished, so clear from here — the frost
@@ -145,12 +210,17 @@ class PanelEngine(
                 handler.removeCallbacks(peakHold)
                 f.tauS = COARSE_CLEAR_TAU_S
                 f.setTarget(0f)
+            } else if (hinge.externalActive && !timedResolve && f != null && f.current > DuoShader.FLAT_EPSILON) {
+                // Continuous but sparse source: a quick final push can jump
+                // 10° in one reading; let the frost clear rather than cut it.
+                // The follower dismisses at flat.
+                f.setTarget(0f)
             } else {
                 // At rest: drop the overlay now rather than easing the last degrees.
                 dismiss(fadeMs = FADE_OUT_FLAT_MS)
             }
-        } else if (!timedResolve) {
-            follower?.setTarget(tilt)
+        } else if (!timedResolve && f != null) {
+            if (hinge.canFollow) followHinge(f) else f.setTarget(tilt)
         }
     }
 
@@ -167,6 +237,16 @@ class PanelEngine(
         if (inner != innerPanel) {
             innerPanel = inner
             panelSwitched = true
+            stalled = false
+            val at = hinge.lastAngle
+            if (inner && hinge.canFollow && at.isFinite()) {
+                // The swap on a one-panel-at-a-time phone: display 0 just flipped
+                // to the inner mode. Full frost here; and learn where "here" is.
+                innerFullAt = at
+                hinge.learnSwap(at)
+            } else {
+                innerFullAt = Float.NaN
+            }
             if (phase != Phase.IDLE) removeOverlay() // old panel's snapshot is meaningless now
         }
         val angle = hinge.lastAngle
@@ -175,10 +255,17 @@ class PanelEngine(
         if (tilt < DuoShader.FLAT_EPSILON) {
             restArmed = true
             panelSwitched = false
+            stalled = false
+            if (!innerPanel) innerFullAt = Float.NaN
             return
         }
         if (phase != Phase.IDLE) return
         when {
+            stalled && hinge.canFollow && stallAngle.isFinite() && kotlin.math.abs(angle - stallAngle) >= STALL_RESUME_DEG -> {
+                stalled = false
+                Log.i(TAG, "display $displayId: hinge moved on after a stall (inner=$inner) at hinge=$angle; resuming")
+                startEffect(afterSwap = false)
+            }
             panelSwitched -> {
                 panelSwitched = false
                 restArmed = false
@@ -380,7 +467,7 @@ class PanelEngine(
         // motion, so: frost in on leaving rest and hold; on the fresh panel
         // start frosted and hold; clear only when the rest stop arrives (see
         // onHinge) or the hold cap expires.
-        val tilt = startTilt ?: if (coarse) (if (afterSwap) peak else DuoShader.FLAT_EPSILON * 1.2f) else currentTilt()
+        val tilt = startTilt ?: if (coarse) (if (afterSwap) peak else DuoShader.FLAT_EPSILON * 1.2f) else tiltFor(hinge.estimate())
         // A capture lands late; the live blur is instant, so it's never "too late".
         val nearlyDone = bitmap != null && afterSwap && live &&
             if (innerPanel) angle > SKIP_INNER_ABOVE_HINGE else angle < SKIP_COVER_BELOW_HINGE
@@ -455,19 +542,30 @@ class PanelEngine(
             // Content was already live on this panel; ease the frost in.
             created.fadeIn(FADE_IN_MS)
         }
-        follower = TiltFollower { t ->
+        val f = TiltFollower { t ->
             created.tilt = t
             if (t < DuoShader.FLAT_EPSILON && !demoRunning) dismiss(fadeMs = FADE_OUT_FLAT_MS)
         }.also { it.snap(startTilt) }
+        follower = f
         lastHingeMoveMs = SystemClock.uptimeMillis()
+        lastSettleEstimate = hinge.estimate()
         timedResolve = easeTo != null
         if (easeTo != null) {
-            follower?.tauS = if (hinge.isCoarse) COARSE_EASE_TAU_S else TIMED_RESOLVE_TAU_S
-            follower?.setTarget(easeTo)
+            f.tauS = when {
+                // Opening from shut on a stops-only sensor with a posture: the
+                // cover is lit from TENT until the panels swap (~1–1.5 s on a Z
+                // Fold), and nothing reports the angle meanwhile — spread the
+                // frost-in over that rather than snapping to full.
+                !inner && easeTo > DuoShader.FLAT_EPSILON && hinge.isCoarse && hinge.posture == com.duoopen.fold.HingePosture.TENT -> COVER_OPEN_TAU_S
+                hinge.isCoarse -> COARSE_EASE_TAU_S
+                else -> TIMED_RESOLVE_TAU_S
+            }
+            f.setTarget(easeTo)
             if (easeTo > DuoShader.FLAT_EPSILON) {
                 handler.postDelayed(peakHold, if (hinge.isCoarse) COARSE_PEAK_HOLD_MS else PEAK_HOLD_MS)
             }
         } else {
+            if (hinge.canFollow && !demoRunning) followHinge(f)
             handler.postDelayed(settleCheck, SETTLE_TIMEOUT_MS)
         }
     }
@@ -585,6 +683,8 @@ class PanelEngine(
         const val TIMED_RESOLVE_TAU_S = 0.07f
         /** Slower ease for stops-only sensors, so a frost-in reads as a fold (≈ 450 ms). */
         const val COARSE_EASE_TAU_S = 0.12f
+        /** Cover frost-in from TENT on a stops-only sensor: the swap is ~1–1.5 s away. */
+        const val COVER_OPEN_TAU_S = 0.4f
         /** Clear-out once a stops-only sensor reports the rest stop (≈ 300 ms). */
         const val COARSE_CLEAR_TAU_S = 0.08f
         /** How long a timed frost-up stays before it fades, absent a panel swap. */
@@ -593,6 +693,8 @@ class PanelEngine(
         const val COARSE_PEAK_HOLD_MS = 2_500L
         /** Tilt hysteresis for leaving a rest pose, so hinge jitter doesn't fire. */
         const val REST_LEAVE_TILT = 3f
+        /** After a mid-fold pause dropped the overlay, this much further movement brings it back. */
+        const val STALL_RESUME_DEG = 6f
         /** After a swap, don't bother if the fold is nearly finished by capture time. */
         const val SKIP_INNER_ABOVE_HINGE = 135f
         const val SKIP_COVER_BELOW_HINGE = 10f

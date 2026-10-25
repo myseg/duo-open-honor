@@ -9,6 +9,7 @@ class DuoApplication : Application() {
         // The activity and the wallpaper service share this process and read
         // the same settings flow.
         DuoSettings.init(this)
+        com.duoopen.fold.HingeProfile.init(this)
         com.duoopen.overlay.OverlayFeature.initProcess(this)
     }
 }

@@ -6,6 +6,7 @@ Duo Open is MIT-licensed (see LICENSE). It builds on, and is grateful to:
 |---|---|---|
 | Duo-animation — frosted-glass fold shader (Metal, ported to AGSL here) | https://github.com/Atomicx7/Duo-animation | No license file upstream; used with attribution. |
 | Duo Fold Live — Samsung fold-wallpaper angle source, shell-side display capture with layer exclusion, capture-API resolution | https://github.com/joeconsorti/duo-fold-live | MIT; Copyright (c) 2026 Duo Fold Live contributors. Techniques re-implemented in `app/src/full/java/com/duoopen/shell/`. |
+| Duo Open for Galaxy — Samsung sensor-HAL hinge log (`sensors-hal`: `folding_angle` / `lid_angle_fusion` steps, hall-sensor shut line), between-readings hinge tracker, hidden DeviceStateManager posture feed, learned panel-swap angle | https://github.com/OrangeHubX/duo-open-for-galaxy | MIT (a fork of this project; its additions are used under the same licence). `fold/HingeTracker.kt` and `fold/DeviceStateFeed.kt` are adapted from it; the log formats in `shell/DuoShellService.kt` follow its measurements on a Galaxy Z Fold 8 Ultra. |
 | Shizuku API | https://github.com/RikkaApps/Shizuku-API | Apache-2.0 |
 | AndroidHiddenApiBypass | https://github.com/LSPosed/AndroidHiddenApiBypass | Apache-2.0 |
 

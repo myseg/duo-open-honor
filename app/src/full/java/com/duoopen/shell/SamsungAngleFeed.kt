@@ -14,20 +14,27 @@ import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
 import com.duoopen.fold.HingeAngleSource
+import com.duoopen.fold.HingeTracker
 
 /**
- * Continuous hinge angle on Samsung foldables, where the public sensor only
- * reports 0/90/180: Samsung's own "Fold interactive" home wallpaper receives
- * the real angle, and logs it (`mCurrentAngle=…`) whenever it's sent a
- * wallpaper command. So: keep a 1×1 wallpaper-showing anchor window, ping the
- * wallpaper through it at [POLL_MS], and let the Shizuku-side log reader
- * ([DuoShellService]) call back with each value, which is fed into
- * [HingeAngleSource] as the live angle.
+ * The real hinge angle on Samsung foldables, where the public sensor only
+ * reports 0/90/180. The Shizuku-side log reader ([DuoShellService]) follows
+ * two of Samsung's own components:
  *
- * Technique from Duo Fold Live (github.com/joeconsorti/duo-fold-live, MIT).
- * Requires: Shizuku authorised, and that wallpaper set as the home wallpaper.
+ * - the **sensor HAL's** hinge-sensor lines — a reading every 10–11° per
+ *   sensor, two sensors interleaved, over the whole fold, whatever is on
+ *   screen, nothing to set up (technique: Duo Open for Galaxy, MIT);
+ * - the **Fold interactive wallpaper**, which logs the angle to 1° whenever
+ *   it's sent a wallpaper command and is visible. If that wallpaper is the
+ *   home wallpaper, a 1×1 wallpaper-showing anchor window pings it at
+ *   [POLL_MS] (technique: Duo Fold Live, MIT).
+ *
+ * Both are fed into [HingeAngleSource]; the wallpaper's readings win while
+ * they flow (finer, faster), the HAL's take over the moment they stop (an
+ * app in front hides the wallpaper), and the tracker fills in between the
+ * HAL's steps. Requires: Shizuku authorised.
  */
-class WallpaperAngleFeed(
+class SamsungAngleFeed(
     private val context: Context,
     private val handler: Handler,
     private val hinge: HingeAngleSource,
@@ -38,6 +45,10 @@ class WallpaperAngleFeed(
     private var anchorWm: WindowManager? = null
     private var anchorKey = ""
     private var lastCallbackUptime = 0L
+    private var lastWallpaperUptime = 0L
+    private var startedAt = 0L
+    private var halReadings = 0
+    private var wallpaperReadings = 0
 
     /** One line for the UI. */
     @Volatile
@@ -49,14 +60,19 @@ class WallpaperAngleFeed(
     private val poll = object : Runnable {
         override fun run() {
             if (!running) return
+            if (!foldWallpaperActive(context)) {
+                removeAnchor()
+                handler.postDelayed(this, WALLPAPER_RECHECK_MS)
+                return
+            }
             val pm = context.getSystemService(PowerManager::class.java)
             if (pm?.isInteractive != false) {
-                runCatching { ensureAnchor() }.onFailure { status = "Anchor failed: ${it.message}" }
+                runCatching { ensureAnchor() }.onFailure { Log.w(TAG, "anchor: ${it.message}") }
                 val a = anchor
                 if (a != null && a.windowToken != null) {
                     runCatching {
                         WallpaperManager.getInstance(a.context).sendWallpaperCommand(a.windowToken, action, 0, 0, 0, null)
-                    }.onFailure { status = "Wallpaper command failed: ${it.message}" }
+                    }.onFailure { Log.w(TAG, "wallpaper command: ${it.message}") }
                 }
             }
             handler.postDelayed(this, POLL_MS)
@@ -68,28 +84,30 @@ class WallpaperAngleFeed(
             if (!running) return
             val b = ShizukuBridge.angleStatus()
             val age = if (lastCallbackUptime == 0L) -1 else SystemClock.uptimeMillis() - lastCallbackUptime
-            status = if (b == null) "Reader unreachable" else
-                "Reader ${b.getString("state")}: ${b.getInt("parsed")} angles / ${b.getInt("lines")} lines" +
-                    (if (age >= 0) " · last ${age} ms ago" else " · nothing received yet")
+            status = if (b == null) "Reader unreachable" else buildString {
+                append("Reader ${b.getString("state")}: $halReadings sensor + $wallpaperReadings wallpaper readings")
+                append(if (age >= 0) " · last ${if (age < 10_000) "$age ms" else "${age / 1000} s"} ago" else " · fold the phone to see one")
+                if (!foldWallpaperActive(context)) append(" · (Fold interactive wallpaper not set: sensor log only)")
+            }
+            // Nothing is logged while the hinge is still; let the posture and
+            // the stops sensor speak for it until it moves again.
             if (age > STALE_MS || (age < 0 && SystemClock.uptimeMillis() - startedAt > STALE_MS)) hinge.clearExternal()
             handler.postDelayed(this, 1_000)
         }
     }
-    private var startedAt = 0L
 
     fun start() {
         if (running) return
         if (!ShizukuBridge.ready) { status = "Shizuku not ready"; return }
-        if (!foldWallpaperActive(context)) { status = "Samsung's Fold interactive wallpaper isn't the home wallpaper"; return }
         action = "com.duoopen.angle.READ_${SystemClock.elapsedRealtime()}"
-        if (!ShizukuBridge.startAngles(action) { angle -> handler.post { onAngle(angle) } }) {
+        if (!ShizukuBridge.startAngles(action) { angle, at, source -> handler.post { onReading(angle, at, source) } }) {
             status = "Couldn't start the log reader"
             return
         }
         running = true
         startedAt = SystemClock.uptimeMillis()
         status = "Starting"
-        Log.i(TAG, "wallpaper angle feed started ($action)")
+        Log.i(TAG, "Samsung angle feed started ($action)")
         handler.post(poll)
         handler.postDelayed(statusTick, 1_000)
     }
@@ -100,10 +118,11 @@ class WallpaperAngleFeed(
         handler.removeCallbacks(poll)
         handler.removeCallbacks(statusTick)
         ShizukuBridge.stopAngles()
+        hinge.externalFeedRunning = false
         hinge.clearExternal()
         removeAnchor()
         status = "Stopped"
-        Log.i(TAG, "wallpaper angle feed stopped")
+        Log.i(TAG, "Samsung angle feed stopped")
     }
 
     /** Re-check the anchor after a panel swap. */
@@ -111,10 +130,36 @@ class WallpaperAngleFeed(
         if (running) runCatching { ensureAnchor() }
     }
 
-    private fun onAngle(angle: Float) {
+    private fun onReading(angle: Float, sampleUptimeMs: Long, source: Int) {
         if (!running) return
-        lastCallbackUptime = SystemClock.uptimeMillis()
-        hinge.feedExternal(angle)
+        val now = SystemClock.uptimeMillis()
+        when (source) {
+            ShellProtocol.SOURCE_UNSHUT -> return
+            ShellProtocol.SOURCE_SHUT -> {
+                // The hall sensor: the phone is shut, whatever the last angle line said.
+                lastCallbackUptime = now
+                hinge.feedExternal(0f, sampleUptimeMs, HingeTracker.SOURCE_OTHER)
+                return
+            }
+            ShellProtocol.SOURCE_WALLPAPER -> {
+                lastWallpaperUptime = now
+                wallpaperReadings++
+                lastCallbackUptime = now
+                hinge.externalFeedRunning = true
+                hinge.feedExternal(angle, sampleUptimeMs, HingeTracker.SOURCE_OTHER)
+            }
+            ShellProtocol.SOURCE_FOLDING, ShellProtocol.SOURCE_LID -> {
+                halReadings++
+                lastCallbackUptime = now
+                // Proven to work: real angles come from every posture, so the
+                // device state needn't stand in for them from now on.
+                hinge.externalFeedRunning = true
+                // The wallpaper is finer and faster while it's visible; the
+                // HAL's steps only matter once it has gone quiet.
+                if (now - lastWallpaperUptime < WALLPAPER_PRIORITY_MS) return
+                hinge.feedExternal(angle, sampleUptimeMs, source)
+            }
+        }
     }
 
     private fun displayKey(d: Display): String {
@@ -165,7 +210,10 @@ class WallpaperAngleFeed(
     companion object {
         private const val TAG = "DuoAngleFeed"
         const val POLL_MS = 33L
+        private const val WALLPAPER_RECHECK_MS = 3_000L
         private const val STALE_MS = 2_500L
+        /** A HAL step this soon after a wallpaper reading adds nothing. */
+        private const val WALLPAPER_PRIORITY_MS = 300L
         val FOLD_WALLPAPER = ComponentName(
             "com.samsung.android.wallpaper.live",
             "com.samsung.android.wallpaper.live.fold.FoldInteractive",

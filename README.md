@@ -14,9 +14,10 @@ Based on the AGSL shader from
 Each half of the screen acts as a pane of frosted glass hinged at the crease.
 While the phone is partly folded the moving half is blurred and darkened by
 how far it is from flat; as the hinge reaches 180° the picture settles into
-focus. Both panels take part: the cover screen frosts in over the first ~20°
-of an open, then the inner screen picks up frosted and clears. Closing plays
-it in reverse.
+focus. Both panels take part: the cover screen frosts in from closed until
+the inner screen takes over (~20° on the OnePlus Open, ~85° on a Galaxy Z
+Fold — the app learns where your phone does it), then the inner screen picks
+up fully frosted and clears. Closing plays it in reverse.
 
 It works over *everything* — your own wallpaper, icons, widgets, the lock
 screen, whatever app is open — because it runs as an accessibility service
@@ -67,13 +68,23 @@ can work around without root.
 built-in display, so if your phone leaves the cover screen on while the
 inner screen is active, the cover and inner effects run side by side and the
 handover has no gap: the cover frosts in from closed, the inner screen lights
-up and clears, and a cover that stays lit clears again on its own as you
-reach flat (it peaks mid-fold, since there is no swap to hand over to).
+up fully frosted exactly where it appeared, and both then clear together as
+you reach flat. The cover's frost is one continuous curve — up to the
+takeover angle, then back down over the same range the inner screen clears
+over — whether or not the inner panel is lit, so nothing jumps when the
+inner panel switches on or off. Closing is the mirror image.
 
 I don't own such a device, so this path is verified only on an emulator with
 a simulated second display (Android's *Developer options → Simulate
 secondary displays*, plus `adb shell settings put global duoopen_test_displays 1`
 so the service accepts it): both panels get an engine and play together.
+Two emulator quirks to know when reproducing that: add the simulated display
+*before* enabling the service (accessibility windows can't attach to one
+added afterwards), and the emulator never changes display 0's physical mode
+when folded, so display 0 always counts as the inner panel there. Drive the
+hinge with `adb emu sensor set hinge-angle0 <degrees>`; the AVD derives its
+CLOSED / HALF_OPENED / OPENED device states from it (0–30 / 30–150 / 150–180),
+which is how the posture feed was checked.
 Two things to know on real hardware: Android's screenshot rate limit is
 global, so in **Snapshot** mode the second panel's capture lands ~0.35 s after
 the first — **Live blur** has no such limit and is the better choice there;
@@ -113,7 +124,8 @@ Full edition:
 4. Optional, recommended on Samsung: install [Shizuku](https://shizuku.rikka.app/),
    start it (wireless debugging or a computer — once per boot), then
    **Tune → Shizuku mode → Authorise**. See *Shizuku mode* below for what it
-   unlocks and the wallpaper it needs for the continuous hinge angle.
+   unlocks — on a Galaxy Z Fold, the real hinge angle instead of 0°/90°/180°,
+   with nothing else to set up.
 
 The **Tune** sheet has strength, frost, darkening, eye distance, which half
 moves (left/right/both), which edge the cover-screen frost comes from, the
@@ -133,10 +145,17 @@ be captured and the effect simply doesn't play there.
 With **Shizuku mode** on, a helper process running with ADB (shell)
 privileges does the capturing instead — again only into memory, only while
 the fold plays, and it refuses frames that contain secure content. For the
-Samsung continuous angle it also tails the system log, but only for lines
-from Samsung's fold wallpaper (`logcat -s SprWallpaper|FoldInteractive`);
-nothing else is read. Both helpers exit when the service stops, and none of
-it runs unless you authorise Duo Open in Shizuku.
+Samsung continuous angle it also tails the system log, but only for two
+tags: the sensor HAL's (`sensors-hal`), of which it parses just the two
+hinge sensors' readings and the hall sensor's shut/open line, and Samsung's
+fold wallpaper (`SprWallpaper|FoldInteractive`), of which it parses just the
+replies to Duo Open's own pings. Nothing else is read. Both helpers exit when
+the service stops, and none of it runs unless you authorise Duo Open in
+Shizuku.
+
+Without Shizuku the service also listens to the system's fold posture
+(closed / tent / half-open / open) through a hidden Android API, the same
+signal that decides which screen is lit. Nothing is sent anywhere.
 
 ## Known limits
 
@@ -146,16 +165,49 @@ it runs unless you authorise Duo Open in Shizuku.
 - If you stop partway (tent mode) the overlay fades out after ~0.7 s so the
   live screen isn't hidden.
 - Reinstalling the app turns the accessibility service off again.
-- **Stops-only hinge sensors.** Some foldables only let apps read three
-  hinge positions — the Galaxy Z Fold 7 and earlier report 0 / 90 / 180
-  (`resolution 90°`); Samsung's continuous `folding_angle` sensor needs a
-  system permission. On those the fold can't follow your hand: each stop
-  change plays a ~0.5 s ease instead (frost in on leaving rest, frost out
-  once the other panel lights up). **Tune** says so when it detects one,
-  and **Copy sensor report** dumps every hinge-related sensor for a bug
-  report. Measured on a Galaxy Z Fold 8 (Android 17): its public
-  `hinge_angle` is also stops-only (0 / 90 / 180), so this applies to Fold 8
-  too. The Pixel Folds expose a continuous angle.
+- **Stops-only hinge sensors.** Galaxy Z Folds only let apps read three
+  hinge positions — `hinge_angle` reports 0 / 90 / 180 (`resolution 90°`),
+  measured on a Fold 7 and a Fold 8; Samsung's continuous `folding_angle`
+  sensor needs a system permission. Without Shizuku the fold can't follow
+  your hand there: each posture or stop change plays a timed ease instead
+  (the cover frosts in as soon as the system says *tent*, before the first
+  90° report; the inner screen picks up frosted and clears once the open
+  stop arrives). **Tune** says so when it detects one, and **Copy sensor
+  report** dumps every hinge-related sensor and posture for a bug report.
+  **Shizuku mode** lifts the limit — see below. The Pixel Folds and the
+  OnePlus Open expose a continuous angle.
+
+## How the hinge is followed
+
+What the shader draws each frame comes from `fold/HingeAngleSource.estimate`,
+not straight from the last sensor event:
+
+- **Fine sensors** (OnePlus Open, Pixel Fold: ~1° steps at ~50 Hz) get a
+  ~25 ms lead from their measured speed, fading out as soon as events stop,
+  which takes the sensor pipeline's latency out of the ease without
+  overshooting when you stop.
+- **Sparse sources** (Samsung's sensor log via Shizuku: a reading every
+  ~5°) are tracked between readings (`fold/HingeTracker.kt`): speed from
+  consecutive readings of the same sensor, position carried forward from
+  each sensor's last reading, and a glide that eases off before the point
+  the next reading must have come from — so a hand that slows down meets a
+  frost that slows down, and the frost never moves backwards mid-fold.
+- **Fold posture** from the hidden `DeviceStateManager` (no Shizuku) —
+  CLOSED is authoritative everywhere (the OnePlus hinge goes quiet at ~30°
+  on a close; the posture says when it's shut), and on a stops-only sensor
+  TENT / HALF_OPENED / OPENED stand in for the angle, arriving before the
+  stops do.
+- **The panel-swap angle is learned.** Whenever a swap is seen with a
+  continuous angle (display 0 flipping modes, a second display lighting, or
+  Samsung's TENT→HALF_OPENED), the angle is remembered (`fold/HingeProfile`,
+  across restarts). The cover is fully frosted exactly there and the inner
+  screen clears from exactly there — ~20° on the OnePlus Open, ~85° on a
+  Galaxy Z Fold, whatever a Pixel does. Until learned: 85° where the phone
+  exposes a device state, else 20°. **Tune → Forget learned angles** resets
+  it.
+- **Pausing mid-fold** (tent, flex mode) still fades the overlay out after
+  ~0.7 s so the live screen shows; moving the hinge another ~6° brings it
+  back with a fresh capture instead of leaving the rest of that fold bare.
 
 ## Build
 
@@ -163,6 +215,7 @@ it runs unless you authorise Duo Open in Shizuku.
 ./gradlew assembleFullDebug     # debug-signed, full edition
 ./gradlew assembleLiteRelease   # wallpaper-only edition
 ./gradlew assembleRelease       # both editions, signed with keystore.properties if present
+./gradlew testFullDebugUnitTest # JVM tests: hinge tracker, tilt mapping, Samsung log parser
 ```
 The `full`/`lite` product flavors differ only by `src/full` (accessibility
 service, overlay, setup guide) and `src/lite` (stubs); everything else is
@@ -180,12 +233,16 @@ watch it with `adb logcat -s DuoOverlay`.
 
 ```
 app/src/main/res/raw/duo_unfold.agsl      fold shader (hinge line, moving side, eye)
-src/full/…/shell/DuoShellService.kt       Shizuku user service: display capture, wallpaper angle log reader
+src/full/…/shell/DuoShellService.kt       Shizuku user service: display capture, Samsung hinge log reader
+src/full/…/shell/SamsungHingeLog.kt       parses the sensor-HAL and fold-wallpaper log lines
 src/full/…/shell/ShizukuBridge.kt         app side: state, permission, binder calls
-src/full/…/shell/WallpaperAngleFeed.kt    pings Samsung's fold wallpaper, feeds the continuous angle
-fold/DuoShader.kt                         uniforms, hinge→tilt mapping, fold placement
-fold/HingeAngleSource.kt                  hinge sensor picker (vendor fallback, coarse detection, report)
-fold/TiltFollower.kt                      per-vsync ease that hides the sensor's 1° steps
+src/full/…/shell/SamsungAngleFeed.kt      feeds the shell reader's angles in; pings the fold wallpaper if set
+fold/DuoShader.kt                         uniforms, hinge→tilt mapping (swap angle), fold placement
+fold/HingeAngleSource.kt                  hinge sensor picker, external feed, posture, estimate(), report
+fold/HingeTracker.kt                      carries the hinge between a sparse source's readings
+fold/HingeProfile.kt                      learned panel-swap angle, persisted
+fold/DeviceStateFeed.kt                   fold posture from the hidden DeviceStateManager
+fold/TiltFollower.kt                      per-vsync ease; follows estimate() every frame
 fold/Panels.kt                            inner vs cover panel from the display mode
 overlay/OverlayFeature.kt                 per-flavor facade (full: the service; lite: stubs)
 src/full/…/overlay/FoldOverlayService.kt  accessibility service: one engine per lit display
@@ -209,9 +266,12 @@ settings/DuoSettings.kt                   shared tuning (SharedPreferences + Sta
   are only entered when an app asks for dual-screen (camera cover preview,
   Interpreter); the service accepts the second built-in display when that
   happens (it matches the default display's name, "Built-in Screen").
-- Public `hinge_angle` reports only 0 / 90 / 180, so the fold plays as timed
-  eases per stop: cover frosts in at the first 90° event, the inner panel
-  lights ~0.5 s later and its capture takes ~0.2–0.3 s, then it clears.
+- Public `hinge_angle` reports only 0 / 90 / 180. Without Shizuku the fold
+  plays as timed eases: the cover frosts in when the device state says TENT
+  (which on a Z Fold 8 Ultra arrives ~0.4 s before the first 90° report),
+  the inner panel lights at ~85° (HALF_OPENED), its capture takes ~0.2–0.3 s,
+  then it clears when the open stop arrives. With Shizuku the sensor HAL's
+  log gives a reading every ~5° and the fold follows your hand.
 - One UI has SurfaceFlinger window blur disabled, so **Live blur** is greyed
   out; Snapshot only.
 
@@ -221,17 +281,26 @@ settings/DuoSettings.kt                   shared tuning (SharedPreferences + Sta
   the cover (1116×2484) and inner panels at ~10–30° depending on speed.
 - The hinge sensor is wake-up only and sends nothing on registration, goes
   quiet at ~30° during a close, and idles anywhere from 0–5° when shut. The
-  service compensates for all three.
+  service compensates for all three (the device state's CLOSED, where
+  available, is the definitive "shut").
 
 ## Related projects
 
 Other takes on the same idea, useful for comparing approaches:
 
+- [OrangeHubX/duo-open-for-galaxy](https://github.com/OrangeHubX/duo-open-for-galaxy)
+  — Samsung-only fork of this app (Fold 8 Ultra) with the sensor-log angle
+  source, early screen takeover through a device-state override, and black
+  dips at the hand-overs. See Credits.
 - [ServerReset/duo-open](https://github.com/ServerReset/duo-open) and
   [nihal711/Z-Fold-Duo-TEST](https://github.com/nihal711/Z-Fold-Duo-TEST)
   — forks of this app for the Galaxy Z Fold 7/8. The sensor picker and the
   coarse-sensor handling here follow what they found on Samsung hardware;
   Z-Fold-Duo also streams live frames through an embedded ADB shell process.
+- [bunkaich/Folduo](https://github.com/bunkaich/Folduo) and its Fold 8 fork
+  [sjw1933/Folduo](https://github.com/sjw1933/Folduo) — another take with
+  the fold-wallpaper angle via Shizuku; documented the Fold 7 vs Fold 8
+  wallpaper log formats.
 - [iamkeeler/FoldFX](https://github.com/iamkeeler/FoldFX) — no screenshots:
   a transparent overlay with compositor blur behind it, plus scrim and light
   sweep. Live content and no accessibility service, but no perspective and
@@ -255,15 +324,20 @@ When Duo Open is authorised in Shizuku, **Tune → Shizuku mode** offers:
   switched on, and the picture under the frost is re-captured at ~12 fps so
   it stays *live* instead of frozen.
 - **Continuous hinge angle on Samsung foldables.** The public sensor on a
-  Galaxy Z Fold only reports 0°/90°/180°, but Samsung's own "Fold interactive"
-  home wallpaper receives the real angle and logs it whenever it's sent a
-  wallpaper command. Duo Open pings it ~30×/s and the shell helper reads the
-  log, so the fold tracks your hand. Needs that wallpaper set as the home
-  wallpaper (Samsung's wallpaper settings; it's one of the built-ins).
+  Galaxy Z Fold only reports 0°/90°/180°. Samsung's own hinge sensors,
+  `folding_angle` and `lid_angle_fusion`, need a system-only permission —
+  but the sensor HAL writes each step of both to the system log (every 11°
+  and every 10°, interleaved: a reading every ~5°, with the time it was
+  sampled), over the whole fold and whatever is on screen. The shell helper
+  reads just those lines and the fold tracks your hand, with nothing else to
+  set up. If Samsung's built-in "Fold interactive" home wallpaper is set as
+  well, Duo Open also pings it ~30×/s and takes its 1° readings while it is
+  visible, dropping back to the sensor log the moment an app covers it.
 
-Both techniques were worked out by **Duo Fold Live** — see Credits. Without
-Shizuku everything falls back to the accessibility screenshot and the public
-sensor, exactly as before.
+The capture and the wallpaper angle were worked out by **Duo Fold Live**,
+the sensor-log angle, the between-readings tracking and the posture feed by
+**Duo Open for Galaxy** — see Credits. Without Shizuku everything falls back
+to the accessibility screenshot, the public sensor and the fold posture.
 
 ## Credits
 
@@ -275,6 +349,14 @@ sensor, exactly as before.
   capture with layer exclusion; Duo Open's Shizuku mode re-implements those
   techniques and follows their capture-API resolution and log-format
   findings. Thank you.
+- **[OrangeHubX/duo-open-for-galaxy](https://github.com/OrangeHubX/duo-open-for-galaxy)**
+  (MIT) — a Samsung-only fork of this app, developed on a Galaxy Z Fold 8
+  Ultra. It found that Samsung's sensor HAL logs the real hinge angle in
+  10–11° steps, wrote the tracker that carries the hinge between those
+  readings, and read the fold posture from the hidden device-state API;
+  `HingeTracker`, `DeviceStateFeed` and the sensor-log parsing here are
+  adapted from it, and the learned panel-swap angle follows its lead.
+  Thank you.
 - **[Shizuku](https://github.com/RikkaApps/Shizuku)** (Apache-2.0) — the
   ADB-assisted access behind Shizuku mode.
 - **[AndroidHiddenApiBypass](https://github.com/LSPosed/AndroidHiddenApiBypass)**

@@ -111,8 +111,13 @@ class DuoWallpaperService : WallpaperService() {
         }
 
         private fun onHingeAngle(angle: Float) {
-            val tilt = tiltFor(angle)
-            if (isInner() && isVisible && surfaceReady) follower.setTarget(tilt) else follower.snap(tilt)
+            if (isInner() && isVisible && surfaceReady) {
+                // Re-read the hinge every frame: a little lead on a fine
+                // sensor, the tracked glide between a sparse source's readings.
+                follower.follow { now -> tiltFor(hinge.estimate(now)) }
+            } else {
+                follower.snap(tiltFor(angle))
+            }
         }
 
         private fun tiltFor(angle: Float): Float =

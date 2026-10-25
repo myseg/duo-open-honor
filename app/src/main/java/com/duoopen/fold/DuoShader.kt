@@ -33,7 +33,11 @@ object DuoShader {
      */
     const val FLAT_HINGE = 172f
 
-    /** Hinge angle at which the panels swap (OnePlus Open: ~20°). */
+    /**
+     * Default hinge angle at which the panels swap (OnePlus Open: ~20°). A
+     * Galaxy Z Fold swaps at ~85°; the real value is learned per phone
+     * ([HingeProfile]) and passed in by the callers that know it.
+     */
     const val PANEL_ON_HINGE = 20f
 
     /** A closed OnePlus Open idles anywhere from 0° to ~5°; below this the cover counts as at rest. */
@@ -64,37 +68,47 @@ object DuoShader {
      * [PANEL_ON_HINGE]..[FLAT_HINGE] is mapped linearly onto 0..[MAX_TILT],
      * so the frost keeps resolving the whole way open. Intensity scales it.
      */
-    fun tiltForHinge(hingeDegrees: Float, config: DuoConfig): Float {
-        val progress = ((FLAT_HINGE - hingeDegrees) / (FLAT_HINGE - PANEL_ON_HINGE)).coerceIn(0f, 1f)
+    fun tiltForHinge(hingeDegrees: Float, config: DuoConfig, swapHinge: Float = HingeProfile.swapHingeOr(PANEL_ON_HINGE)): Float {
+        val from = swapHinge.coerceIn(CLOSED_HINGE + 1f, FLAT_HINGE - 10f)
+        val progress = ((FLAT_HINGE - hingeDegrees) / (FLAT_HINGE - from)).coerceIn(0f, 1f)
         val full = if (config.movingSide == 0) MAX_TILT * 0.6f else MAX_TILT
         return (progress * full * config.intensity).coerceIn(0f, MAX_TILT)
     }
 
     /**
-     * Tilt on the cover panel, which is live only for the first/last
-     * [PANEL_ON_HINGE] degrees: flat when closed, fully frosted at the swap.
+     * Tilt on the cover panel: flat when closed, fully frosted at the swap
+     * angle, where the inner panel takes over. On a phone that lights one
+     * panel at a time the cover is off beyond that point, so this is all of
+     * it. On a phone that keeps the cover lit alongside the inner panel
+     * ([staysLit]) there is no swap to hand over to, so past the peak the
+     * cover clears again on its own, over the same range the inner panel
+     * clears over, reaching flat with it. One continuous curve either way —
+     * the mapping must not change when the inner panel lights or dies, or the
+     * frost would jump.
      */
-    fun coverTiltForHinge(hingeDegrees: Float, config: DuoConfig): Float {
-        val progress = ((hingeDegrees - CLOSED_HINGE) / (PANEL_ON_HINGE - CLOSED_HINGE)).coerceIn(0f, 1f)
-        return (progress * MAX_TILT * config.intensity).coerceIn(0f, MAX_TILT)
+    fun coverTiltForHinge(
+        hingeDegrees: Float,
+        config: DuoConfig,
+        swapHinge: Float = HingeProfile.swapHingeOr(PANEL_ON_HINGE),
+        staysLit: Boolean = false,
+    ): Float {
+        val peakAt = swapHinge.coerceIn(CLOSED_HINGE + 1f, FLAT_HINGE - 10f)
+        val shape = if (hingeDegrees <= peakAt) {
+            ((hingeDegrees - CLOSED_HINGE) / (peakAt - CLOSED_HINGE)).coerceIn(0f, 1f)
+        } else if (!staysLit) {
+            1f
+        } else {
+            1f - ((hingeDegrees - peakAt) / (FLAT_HINGE - peakAt)).coerceIn(0f, 1f)
+        }
+        // Ease the peak so the turn from frosting to clearing has no corner.
+        val eased = if (staysLit) shape * shape * (3f - 2f * shape) else shape
+        return (eased * MAX_TILT * config.intensity).coerceIn(0f, MAX_TILT)
     }
 
-    /**
-     * Tilt on a cover panel that stays lit while the inner panel is also on
-     * (phones that drive both screens at once). There is no swap to hand
-     * over to, so the frost must clear by itself: flat when closed, peaking
-     * mid-fold, flat again when open — a half sine over the hinge range.
-     */
-    fun concurrentCoverTiltForHinge(hingeDegrees: Float, config: DuoConfig): Float {
-        val progress = ((hingeDegrees - CLOSED_HINGE) / (FLAT_HINGE - CLOSED_HINGE)).coerceIn(0f, 1f)
-        val bump = kotlin.math.sin(Math.PI * progress).toFloat()
-        return (bump * MAX_TILT * config.intensity).coerceIn(0f, MAX_TILT)
-    }
-
-    fun tiltFor(hingeDegrees: Float, config: DuoConfig, innerPanel: Boolean): Float =
+    fun tiltFor(hingeDegrees: Float, config: DuoConfig, innerPanel: Boolean, swapHinge: Float = HingeProfile.swapHingeOr(PANEL_ON_HINGE)): Float =
         if (hingeDegrees.isNaN()) 0f
-        else if (innerPanel) tiltForHinge(hingeDegrees, config)
-        else coverTiltForHinge(hingeDegrees, config)
+        else if (innerPanel) tiltForHinge(hingeDegrees, config, swapHinge)
+        else coverTiltForHinge(hingeDegrees, config, swapHinge)
 
     /** Fallback hinge placement (centered) when no FoldingFeature is available. */
     fun centeredFold(width: Float, height: Float, foldSplitsLong: Boolean): FoldLine {

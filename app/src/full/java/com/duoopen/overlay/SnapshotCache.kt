@@ -28,5 +28,12 @@ class SnapshotCache(private val maxAgeMs: Long) {
         return b
     }
 
+    /** The latest picture of this panel kind whatever its size (Honor rear cover), or null. */
+    fun latest(innerPanel: Boolean): Bitmap? {
+        val e = entries[innerPanel] ?: return null
+        if (e.bitmap.isRecycled || SystemClock.uptimeMillis() - e.at > maxAgeMs) return null
+        return e.bitmap
+    }
+
     fun ageMs(innerPanel: Boolean): Long? = entries[innerPanel]?.let { SystemClock.uptimeMillis() - it.at }
 }

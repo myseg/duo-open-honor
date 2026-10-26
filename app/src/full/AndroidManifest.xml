@@ -2,9 +2,17 @@
 <!-- Full edition only: the accessibility service behind the system-wide fold.
      The lite edition omits it, so Play Protect and restricted settings have
      nothing to object to. -->
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
     <!-- Optional Shizuku mode (ADB-level helpers); nothing happens unless the user authorises it in Shizuku. -->
     <uses-permission android:name="moe.shizuku.manager.permission.API_V23" />
+    <!-- Honor both-screens mode: draw on the cover while both panels are lit, and turn
+         system animations off around the screen switch. Both granted through Shizuku. -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS"
+        tools:ignore="ProtectedPermissions" />
+
     <queries>
         <package android:name="moe.shizuku.privileged.api" />
     </queries>

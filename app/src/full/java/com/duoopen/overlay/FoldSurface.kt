@@ -9,6 +9,8 @@ import android.graphics.LinearGradient
 import android.graphics.Paint
 import android.graphics.PixelFormat
 import android.graphics.Shader
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.view.Gravity
 import android.view.View
@@ -17,6 +19,7 @@ import android.view.animation.DecelerateInterpolator
 import com.duoopen.fold.DuoShader
 import com.duoopen.fold.FoldLine
 import com.duoopen.settings.DuoConfig
+import java.util.function.Consumer
 import kotlin.math.ceil
 import kotlin.math.roundToInt
 import kotlin.math.sin
@@ -33,11 +36,17 @@ interface FoldSurface {
     fun detach()
 }
 
-private fun overlayParams(width: Int, height: Int, format: Int, extraFlags: Int = 0) =
+private fun overlayParams(
+    width: Int,
+    height: Int,
+    format: Int,
+    extraFlags: Int = 0,
+    type: Int = WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+) =
     WindowManager.LayoutParams(
         width,
         height,
-        WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+        type,
         WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
             WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
             WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
@@ -58,6 +67,7 @@ class SnapshotSurface(
     bitmap: Bitmap,
     config: DuoConfig,
     foldLine: (w: Float, h: Float, config: DuoConfig) -> FoldLine,
+    windowType: Int = WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
 ) : FoldSurface {
     val view = FoldOverlayView(context, bitmap, foldLine).also { it.config = config }
     val attached: Boolean
@@ -70,6 +80,7 @@ class SnapshotSurface(
                     WindowManager.LayoutParams.MATCH_PARENT,
                     WindowManager.LayoutParams.MATCH_PARENT,
                     PixelFormat.OPAQUE,
+                    type = windowType,
                 ),
             )
         }.onFailure { Log.e(TAG, "addView failed", it) }.isSuccess
@@ -114,6 +125,10 @@ class SnapshotSurface(
  * [STRIPS] strip windows from the crease outward, each blurred by the radius
  * the shader would use at its centre, and darkened with a gradient painted
  * on top. Perspective isn't reproduced.
+ *
+ * Honor/MagicOS: a blur set on a window created while a panel is switching on
+ * can be silently dropped, so each strip's radius is re-sent shortly after the
+ * strips appear and again whenever the system re-enables cross-window blur.
  */
 class LiveBlurSurface(
     context: Context,
@@ -121,8 +136,8 @@ class LiveBlurSurface(
     private val config: DuoConfig,
     pxPerMm: Float,
     foldLine: (w: Float, h: Float, config: DuoConfig) -> FoldLine,
+    windowType: Int = WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
 ) : FoldSurface {
-
     private class Strip(val view: StripView, val params: WindowManager.LayoutParams, val dNear: Float, val dFar: Float) {
         var radius = -1
     }
@@ -130,8 +145,18 @@ class LiveBlurSurface(
     private val strips = ArrayList<Strip>()
     private val darkPerPx = config.darkening * REFERENCE_PX_PER_MM / pxPerMm
     private var fade: ValueAnimator? = null
+
     /** 0..1 multiplier used by fade-in/out so a fade reads as the frost easing, not a popping window. */
     private var fadeScale = 1f
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var blurListening = false
+    private val blurListener = Consumer<Boolean> { enabled ->
+        Log.i(TAG, "cross-window blur enabled=$enabled")
+        if (enabled) refreshBlur()
+    }
+    private val kick = Runnable { refreshBlur() }
+
     val attached: Boolean
 
     init {
@@ -142,10 +167,11 @@ class LiveBlurSurface(
         val moving = fold.movingSide ?: config.movingSide
         // Work along the split axis: `len` is the screen extent across the hinge.
         val len = if (fold.splitsX) w else h
-        val regions = ArrayList<Pair<Float, Float>>() // (from, to) along the axis, hinge-relative order irrelevant
-        if (moving <= 0) regions += 0f to fold.position           // left / top pane
-        if (moving >= 0) regions += fold.position to len          // right / bottom pane
+        val regions = ArrayList<Pair<Float, Float>>() // (from, to) along the axis
+        if (moving <= 0) regions += 0f to fold.position // left / top pane
+        if (moving >= 0) regions += fold.position to len // right / bottom pane
         val perRegion = if (regions.size == 2) STRIPS / 2 else STRIPS
+
         var ok = true
         for ((from, to) in regions) {
             val span = to - from
@@ -163,11 +189,16 @@ class LiveBlurSurface(
                 val y = if (fold.splitsX) 0 else a.toInt()
                 val sw = if (fold.splitsX) ceil(b - a).toInt() else w.toInt()
                 val sh = if (fold.splitsX) h.toInt() else ceil(b - a).toInt()
+
                 val view = StripView(context, horizontal = fold.splitsX, darkAtStart = nearIsStart)
-                val params = overlayParams(sw, sh, PixelFormat.TRANSLUCENT, WindowManager.LayoutParams.FLAG_BLUR_BEHIND).apply {
+                val params = overlayParams(
+                    sw, sh, PixelFormat.TRANSLUCENT,
+                    WindowManager.LayoutParams.FLAG_BLUR_BEHIND, windowType,
+                ).apply {
                     this.x = x
                     this.y = y
-                    blurBehindRadius = 0
+                    // Not 0: some builds never set up the blur for a window that starts without one.
+                    blurBehindRadius = 1
                 }
                 val added = runCatching { windowManager.addView(view, params) }
                     .onFailure { Log.e(TAG, "strip addView failed", it) }.isSuccess
@@ -176,7 +207,15 @@ class LiveBlurSurface(
             }
         }
         attached = ok && strips.isNotEmpty()
-        if (!attached) detach()
+        if (!attached) {
+            detach()
+        } else {
+            blurListening = runCatching {
+                windowManager.addCrossWindowBlurEnabledListener(context.mainExecutor, blurListener)
+            }.isSuccess
+            mainHandler.postDelayed(kick, KICK_FIRST_MS)
+            mainHandler.postDelayed(kick, KICK_SECOND_MS)
+        }
     }
 
     override var tilt: Float = 0f
@@ -204,6 +243,25 @@ class LiveBlurSurface(
         }
     }
 
+    /**
+     * Re-send every strip's blur so the system applies it even if it dropped
+     * the first one: nudge the radius by 1, then let [apply] put the real value
+     * back on the next frame (two real changes, so neither is skipped as a no-op).
+     */
+    private fun refreshBlur() {
+        if (strips.isEmpty()) return
+        var bumped = false
+        for (strip in strips) {
+            val r = strip.radius
+            if (r <= 0) continue
+            strip.params.blurBehindRadius = r + 1
+            runCatching { windowManager.updateViewLayout(strip.view, strip.params) }
+            strip.radius = r + 1
+            bumped = true
+        }
+        if (bumped) mainHandler.post { apply() }
+    }
+
     override fun fadeIn(durationMs: Long) = animateScale(0f, 1f, durationMs, null)
 
     override fun fadeOut(durationMs: Long, onEnd: () -> Unit) = animateScale(fadeScale, 0f, durationMs, onEnd)
@@ -228,6 +286,11 @@ class LiveBlurSurface(
 
     override fun detach() {
         fade?.cancel()
+        mainHandler.removeCallbacks(kick)
+        if (blurListening) {
+            runCatching { windowManager.removeCrossWindowBlurEnabledListener(blurListener) }
+            blurListening = false
+        }
         for (strip in strips) runCatching { windowManager.removeViewImmediate(strip.view) }
         strips.clear()
     }
@@ -270,11 +333,17 @@ class LiveBlurSurface(
     private companion object {
         const val TAG = "DuoOverlay"
         const val STRIPS = 6
+
         /** SurfaceFlinger blur gets expensive and flat beyond this. */
         const val MAX_BLUR_PX = 90f
+
         /** Relayout only when the radius moves by this much (each update is a WindowManager round-trip). */
         const val RADIUS_STEP = 4f
         const val MAX_DARK = 0.85f
         const val REFERENCE_PX_PER_MM = 6f
+
+        /** When to re-send the blur after the strips appear. */
+        const val KICK_FIRST_MS = 80L
+        const val KICK_SECOND_MS = 320L
     }
 }

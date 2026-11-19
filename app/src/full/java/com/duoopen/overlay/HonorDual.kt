@@ -104,6 +104,8 @@ class HonorScreens(
     private var setupDone = false
     private var started = false
     private var warnedNoShell = false
+    /** Seen shut while the screen was on: the next open plays. */
+    private var shutArmed = false
 
     /** Both panels are lit on purpose right now (the cover gets a [RearCoverEngine]). */
     val dualActive: Boolean get() = target == Target.DUAL
@@ -113,7 +115,10 @@ class HonorScreens(
 
     /** The hinge can go quiet near the end of a close: stopped low means shut. */
     private val shutGuess = Runnable {
-        if (target == Target.DUAL && !dualOpening && angle in 0f..35f) go(Target.COVER, true)
+        if (target == Target.DUAL && !dualOpening && angle in 0f..35f) {
+            shutArmed = true
+            go(Target.NONE, true)
+        }
     }
 
     private val binderListener = Shizuku.OnBinderReceivedListener { handler.post { setup() } }
@@ -121,7 +126,10 @@ class HonorScreens(
     private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context, i: Intent) {
             when (i.action) {
-                Intent.ACTION_SCREEN_OFF -> go(Target.NONE, false)
+                Intent.ACTION_SCREEN_OFF -> {
+                    shutArmed = false
+                    go(Target.NONE, false)
+                }
                 Intent.ACTION_SCREEN_ON -> listen()
                 else -> evaluate()
             }
@@ -221,7 +229,10 @@ class HonorScreens(
     private fun mode() = setting(KEY_MODE, 2)
     private fun openAt() = setting(KEY_OPEN_AT, 70).toFloat()
     private fun closeAt() = setting(KEY_CLOSE_AT, 90).toFloat()
-    private fun dualFrom() = setting(KEY_DUAL_FROM, 20).toFloat()
+    private fun dualFrom() = setting(KEY_DUAL_FROM, 3).toFloat()
+
+    /** Mode 2 asks for both panels as soon as the hinge leaves shut (retrying until MagicOS allows it); mode 1's override needs the panels already swapped. */
+    private fun openTrigger(m: Int) = if (m == 2) dualFrom() else maxOf(dualFrom(), 10f)
 
     private fun evaluate() {
         val a = angle
@@ -240,10 +251,17 @@ class HonorScreens(
         val now = SystemClock.uptimeMillis()
         when (target) {
             Target.NONE -> when {
-                fresh && a <= 5f -> {
+                // Shut: nothing to send yet. MagicOS cancels a device-state
+                // override the moment the phone stops being physically closed,
+                // so an override set while shut never survives the open.
+                a <= SHUT_DEG -> shutArmed = true
+                shutArmed && a >= openTrigger(m) && a < openAt -> {
+                    shutArmed = false
                     releaseAt = openAt
-                    go(Target.COVER, false)
+                    dualOpening = true
+                    go(if (m == 2) Target.DUAL else Target.COVER, true)
                 }
+                shutArmed && a >= openAt -> shutArmed = false
                 dir < 0 && a > 5f && a <= closeAt && now - lastRelease > 700 -> {
                     releaseAt = maxOf(openAt, a + 15f)
                     dualOpening = false
@@ -259,7 +277,10 @@ class HonorScreens(
             }
             Target.DUAL -> when {
                 a >= releaseAt || a >= 165f -> go(Target.NONE, true)
-                a <= 5f -> go(Target.COVER, true)
+                a <= SHUT_DEG -> {
+                    shutArmed = true
+                    go(Target.NONE, true)
+                }
                 !dualOpening -> {
                     handler.removeCallbacks(shutGuess)
                     handler.postDelayed(shutGuess, SHUT_GUESS_MS)
@@ -291,8 +312,12 @@ class HonorScreens(
                     (if (prev == Target.DUAL) "; cmd device_state state reset" else "")
                 // MagicOS refuses the dual state ("Please use it in expanded
                 // state") while the base state is overridden to CLOSED.
+                // Opening: MagicOS allows it only once the phone is physically
+                // half open (the same moment it swaps panels), so retry until
+                // it's accepted, ~40 ms apart, for up to ~1.5 s.
                 Target.DUAL -> (if (prev == Target.COVER) "cmd device_state base-state reset; " else "") +
-                    "cmd device_state state $DUAL_STATE"
+                    "i=0; while [ \$i -lt $DUAL_RETRIES ]; do i=\$((i+1)); " +
+                    "if cmd device_state state $DUAL_STATE 2>&1 | grep -q Exception; then sleep 0.04; else echo accepted after \$i; break; fi; done"
                 Target.NONE -> RESET_ALL
             },
         )
@@ -353,6 +378,8 @@ class HonorScreens(
         private const val ANIM_RESTORE_MS = 1_500L
         private const val DUAL_MAX_MS = 15_000L
         private const val SHUT_GUESS_MS = 500L
+        private const val SHUT_DEG = 2f
+        private const val DUAL_RETRIES = 30
         private val ALL_ANIM_KEYS = listOf(
             Settings.Global.TRANSITION_ANIMATION_SCALE,
             Settings.Global.WINDOW_ANIMATION_SCALE,

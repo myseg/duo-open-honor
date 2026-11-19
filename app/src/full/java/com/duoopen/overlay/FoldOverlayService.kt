@@ -145,6 +145,18 @@ class FoldOverlayService : AccessibilityService() {
         val display = displayManager.getDisplay(Display.DEFAULT_DISPLAY) ?: return
         val inner = display.isInnerPanel()
         val bitmap = ShizukuBridge.capture(Display.DEFAULT_DISPLAY, emptyList(), HONOR_SNAPSHOT_SCALE) ?: return
+        // A panel caught mid-swap is black: keep the older picture instead.
+        val sw = runCatching { bitmap.copy(android.graphics.Bitmap.Config.ARGB_8888, false) }.getOrNull() ?: return
+        var max = 0
+        for (iy in 0 until 16) for (ix in 0 until 16) {
+            val c = sw.getPixel(((ix + 0.5f) * sw.width / 16).toInt(), ((iy + 0.5f) * sw.height / 16).toInt())
+            max = maxOf(max, ((c shr 16) and 0xFF) + ((c shr 8) and 0xFF) + (c and 0xFF))
+        }
+        sw.recycle()
+        if (max < 30) {
+            Log.i(TAG, "honor: display 0 was black just before both panels lit; keeping the older picture")
+            return
+        }
         handler.post {
             snapshots.put(inner, bitmap)
             Log.i(TAG, "honor: kept a ${if (inner) "inner" else "cover"} picture ${bitmap.width}x${bitmap.height} for the cover")

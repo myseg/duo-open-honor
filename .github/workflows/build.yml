@@ -2,6 +2,8 @@ name: Build Duo Open
 on:
   push:
   workflow_dispatch:
+permissions:
+  contents: write # publish each build as a GitHub Release
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -13,7 +15,27 @@ jobs:
           java-version: 17
       - uses: gradle/actions/setup-gradle@v4
       - run: chmod +x gradlew && ./gradlew assembleFullDebug --stacktrace
+      - name: Name the APK
+        id: apk
+        run: |
+          short=$(git rev-parse --short HEAD)
+          tag="build-${GITHUB_RUN_NUMBER}"
+          out="DuoOpen-${tag}-${short}.apk"
+          cp app/build/outputs/apk/full/debug/*.apk "$out"
+          echo "file=$out" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "short=$short" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         with:
           name: DuoOpen-apk
-          path: app/build/outputs/apk/full/debug/*.apk
+          path: ${{ steps.apk.outputs.file }}
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.apk.outputs.tag }}" "${{ steps.apk.outputs.file }}" \
+            --target "${GITHUB_SHA}" \
+            --title "Build ${GITHUB_RUN_NUMBER} (${GITHUB_REF_NAME}, ${{ steps.apk.outputs.short }})" \
+            --notes "Automatic build of \`${GITHUB_REF_NAME}\` at ${GITHUB_SHA}.
+
+          $(git log -1 --pretty=%B | sed '/^Co-Authored-By:/d;/^Claude-Session:/d')"

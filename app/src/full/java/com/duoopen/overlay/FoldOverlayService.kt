@@ -94,7 +94,11 @@ class FoldOverlayService : AccessibilityService() {
         scope.launch { ShizukuBridge.state.collect { syncAngleFeed() } }
         scope.launch { DuoSettings.config.collect { syncAngleFeed() } }
         syncDisplays()
-        honor = HonorScreens(this, handler, ::onHonorSwitch).also { it.start() }
+        // Device-state numbers and the cover-as-rear-display trick are MagicOS
+        // specific: never send them to another maker's phone.
+        if (HonorScreens.isHonor()) {
+            honor = HonorScreens(this, handler, ::onHonorSwitch).also { it.start() }
+        }
         Log.i(TAG, "connected; hinge=${hinge.sensor?.name} posture=${deviceState?.active} live displays=${engines.keys}")
     }
 

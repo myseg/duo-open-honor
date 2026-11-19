@@ -275,6 +275,27 @@ settings/DuoSettings.kt                   shared tuning (SharedPreferences + Sta
 - One UI has SurfaceFlinger window blur disabled, so **Live blur** is greyed
   out; Snapshot only.
 
+## Honor Magic V3 (MagicOS) notes
+
+- **Use Shizuku.** MagicOS turns the cover screen off at the swap like any
+  one-panel-at-a-time phone. With Shizuku running and Duo Open authorised,
+  the app keeps the cover lit while you open (device-state override), lights
+  both screens together for the handover, and switches system animations off
+  around the swap so MagicOS's own slide doesn't shove the picture in from
+  the side. Without Shizuku none of that can happen: expect a black cover and
+  a gap at the swap. Shizuku starts over Wireless debugging, no PC needed.
+- A freshly-lit Honor panel can stay black for over a second. Duo Open now
+  retries the capture for longer and never shows (or caches) an all-black
+  frame, so the worst case is the live screen rather than a black overlay.
+- **Live blur** (Tune → How it's drawn) avoids the capture wait entirely and
+  is the better choice without Shizuku, if window blur is enabled.
+- Tuning (adb or a Shizuku shell), all `settings put global …`:
+  `duoopen_honor_mode` 0 off / 1 keep cover lit / 2 both screens (default),
+  `duoopen_honor_dual_from` (20), `duoopen_honor_open_at` (70),
+  `duoopen_honor_close_at` (90), `duoopen_honor_anim` 0/1/2,
+  `duoopen_honor_locked` 1 to also run on the lock screen.
+- Logs for a report: `adb logcat -s DuoOverlay DuoHonor`.
+
 ## OnePlus Open notes
 
 - Inner panel 2268×2440, fold splits the short side; display 0 swaps between

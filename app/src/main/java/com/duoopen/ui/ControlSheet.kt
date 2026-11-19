@@ -269,6 +269,22 @@ fun ControlSheet(
                         "reads the real hinge angle (from the system's own sensor log) instead of just 0° / 90° / 180°.",
                 )
                 Hint(shizukuStatus, warn = !shizukuReady)
+                val honor = android.os.Build.MANUFACTURER.equals("HONOR", ignoreCase = true) ||
+                    android.os.Build.BRAND.equals("HONOR", ignoreCase = true)
+                if (honor) {
+                    Spacer(Modifier.height(4.dp))
+                    Hint(
+                        if (shizukuReady) {
+                            "Honor: Shizuku keeps the cover lit while you open and lights both screens together, " +
+                                "so the fold hands over with no black gap."
+                        } else {
+                            "Honor: without Shizuku MagicOS switches the cover off at the swap, so the cover can go black " +
+                                "and there's a gap before the inner screen frosts in. Start Shizuku (Wireless debugging works, " +
+                                "no PC needed) and authorise Duo Open to keep the cover lit and light both screens."
+                        },
+                        warn = !shizukuReady,
+                    )
+                }
                 Spacer(Modifier.height(6.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     if (!shizukuReady) {

@@ -13,6 +13,7 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import android.os.Build
 import android.os.Handler
 import android.os.PowerManager
 import android.os.SystemClock
@@ -93,6 +94,7 @@ class HonorScreens(
     private var dualOpening = true
     private var setupDone = false
     private var started = false
+    private var warnedNoShell = false
 
     /** Both panels are lit on purpose right now (the cover gets a [RearCoverEngine]). */
     val dualActive: Boolean get() = target == Target.DUAL
@@ -132,9 +134,16 @@ class HonorScreens(
                 addAction(Intent.ACTION_SCREEN_OFF)
                 addAction(Intent.ACTION_USER_PRESENT)
             },
-            Context.RECEIVER_EXPORTED,
+            Context.RECEIVER_NOT_EXPORTED, // protected system broadcasts still arrive
         )
-        Log.i(HTAG, "started; mode=${mode()} hinge=${hingeSensor?.name}")
+        Log.i(HTAG, "started; mode=${mode()} hinge=${hingeSensor?.name} shizuku=${HonorShell.ready()}")
+        if (!HonorShell.ready()) {
+            Log.w(
+                HTAG,
+                "Shizuku isn't running or authorised: the cover can't be kept lit and both-screens mode is off. " +
+                    "Without it MagicOS turns the cover off at the swap, so expect a short black gap there.",
+            )
+        }
     }
 
     fun stop() {
@@ -237,7 +246,13 @@ class HonorScreens(
 
     private fun go(next: Target, switching: Boolean) {
         if (next == target) return
-        if (next != Target.NONE && !HonorShell.ready()) return
+        if (next != Target.NONE && !HonorShell.ready()) {
+            if (!warnedNoShell) {
+                warnedNoShell = true
+                Log.w(HTAG, "would switch to ${next.name.lowercase()} at ${angle.toInt()}° but Shizuku isn't ready")
+            }
+            return
+        }
         val prev = target
         target = next
         if (next == Target.NONE) lastRelease = SystemClock.uptimeMillis()
@@ -288,6 +303,10 @@ class HonorScreens(
     }
 
     companion object {
+        /** MagicOS phones (Honor Magic V2 / V3 / V5 …). */
+        fun isHonor(): Boolean =
+            Build.MANUFACTURER.equals("HONOR", ignoreCase = true) || Build.BRAND.equals("HONOR", ignoreCase = true)
+
         /** 0 off, 1 keep the cover on (one screen at a time), 2 both screens (default). */
         const val KEY_MODE = "duoopen_honor_mode"
         const val KEY_OPEN_AT = "duoopen_honor_open_at"

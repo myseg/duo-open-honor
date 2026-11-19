@@ -351,12 +351,16 @@ class PanelEngine(
                     accessibilityCapture(gen, attempt, afterSwap, startTilt, t0, ::retry, ::stale)
                     return@launch
                 }
-                if (afterSwap && attempt < MAX_CAPTURE_ATTEMPTS) {
+                if (afterSwap) {
                     val black = withContext(Dispatchers.Default) { isMostlyBlack(bitmap) }
                     if (stale()) return@launch
                     if (black && !demoRunning) {
-                        Log.i(TAG, "display $displayId: shell capture $attempt is black after ${SystemClock.uptimeMillis() - t0}ms; retrying")
-                        handler.postDelayed({ if (!stale()) capture(gen, attempt + 1, afterSwap, startTilt) }, SHELL_RETRY_MS)
+                        if (attempt < MAX_SHELL_CAPTURE_ATTEMPTS) {
+                            Log.i(TAG, "display $displayId: shell capture $attempt is black after ${SystemClock.uptimeMillis() - t0}ms; retrying")
+                            handler.postDelayed({ if (!stale()) capture(gen, attempt + 1, afterSwap, startTilt) }, SHELL_RETRY_MS)
+                        } else {
+                            giveUpBlack(attempt)
+                        }
                         return@launch
                     }
                 }
@@ -399,7 +403,7 @@ class PanelEngine(
                     if (bridging) bridging = false else phase = Phase.IDLE
                     return
                 }
-                if (!afterSwap || attempt >= MAX_CAPTURE_ATTEMPTS) {
+                if (!afterSwap) {
                     onCaptured(bitmap, afterSwap, startTilt, t0)
                     return
                 }
@@ -411,8 +415,12 @@ class PanelEngine(
                     }
                     if (black && !demoRunning) {
                         bitmap.recycle()
-                        Log.i(TAG, "display $displayId: capture $attempt is black after ${SystemClock.uptimeMillis() - t0}ms; retrying")
-                        retry()
+                        if (attempt < MAX_CAPTURE_ATTEMPTS) {
+                            Log.i(TAG, "display $displayId: capture $attempt is black after ${SystemClock.uptimeMillis() - t0}ms; retrying")
+                            retry()
+                        } else {
+                            giveUpBlack(attempt)
+                        }
                     } else {
                         onCaptured(bitmap, afterSwap, startTilt, t0)
                     }
@@ -435,6 +443,22 @@ class PanelEngine(
                 }
             }
         })
+    }
+
+    /**
+     * The freshly-lit panel was still black after every attempt (MagicOS can
+     * keep a waking panel dark for over a second). Showing that frame would
+     * put an opaque black overlay on the panel — and caching it would bridge
+     * the next fold with black — so drop it: keep the bridge if one is up,
+     * otherwise let the live screen show.
+     */
+    private fun giveUpBlack(attempt: Int) {
+        Log.w(TAG, "display $displayId: panel still black after $attempt captures; not showing it")
+        if (bridging) {
+            bridging = false
+        } else {
+            phase = Phase.IDLE
+        }
     }
 
     private fun onCaptured(bitmap: Bitmap, afterSwap: Boolean, startTilt: Float?, t0: Long) {
@@ -675,9 +699,12 @@ class PanelEngine(
         const val TAG = "DuoOverlay"
         /** The framework rejects screenshots closer together than ~333 ms. */
         const val SCREENSHOT_MIN_INTERVAL_MS = 340L
-        const val MAX_CAPTURE_ATTEMPTS = 3
+        /** Accessibility screenshots are ~340 ms apart, so this covers ~1.4 s of a panel waking up. */
+        const val MAX_CAPTURE_ATTEMPTS = 4
+        /** Shell captures are fast and unthrottled; retry every [SHELL_RETRY_MS] for about as long. */
+        const val MAX_SHELL_CAPTURE_ATTEMPTS = 20
         /** A screenshot of a panel that is still lighting up can take most of a second. */
-        const val CAPTURE_TIMEOUT_MS = 1_100L
+        const val CAPTURE_TIMEOUT_MS = 1_400L
         const val BLACK_THRESHOLD = 30
         /** Ease time constant for the timed resolve (≈ 250 ms to settle). */
         const val TIMED_RESOLVE_TAU_S = 0.07f

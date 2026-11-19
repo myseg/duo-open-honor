@@ -374,7 +374,7 @@ class PanelEngine(
     private fun shellCapture(): Boolean = DuoSettings.config.value.shizukuCapture && ShizukuBridge.ready
 
     /** Our own overlay's layer, so a capture taken while it's up sees the screen beneath it. */
-    private fun excludedLayers(): List<SurfaceControl> {
+    fun excludedLayers(): List<SurfaceControl> {
         val view = (surface as? SnapshotSurface)?.view ?: return emptyList()
         return listOfNotNull(rootSurfaceControl(view))
     }

@@ -20,6 +20,8 @@ import android.os.SystemClock
 import android.provider.Settings
 import com.duoopen.Log
 import android.view.Display
+import android.view.SurfaceControl
+import com.duoopen.shell.ShizukuBridge
 import android.view.WindowManager
 import com.duoopen.fold.DuoShader
 import com.duoopen.fold.HingeAngleSource
@@ -373,6 +375,8 @@ class RearCoverEngine(
     private val hinge: HingeAngleSource,
     private val handler: Handler,
     private val cache: SnapshotCache,
+    /** Our own overlay layers on display 0, left out of the live mirror (main thread). */
+    private val excludedOnDefault: () -> List<SurfaceControl> = { emptyList() },
 ) {
     private val windowManager: WindowManager? = runCatching {
         service.createDisplayContext(display)
@@ -384,6 +388,9 @@ class RearCoverEngine(
     private var tries = 0
     private var destroyed = false
     private val showRunnable = Runnable { tryShow() }
+    private var liveBusy = false
+    private var liveFrames = 0
+    private val liveTick = Runnable { liveFrame() }
 
     init {
         handler.post(showRunnable)
@@ -426,8 +433,8 @@ class RearCoverEngine(
             return
         }
         val age = if (pic === cover) coverAge else innerAge
-        // Own copy: the cache may hand the original to someone else.
-        val copy = runCatching { pic.copy(pic.config ?: Bitmap.Config.ARGB_8888, false) }.getOrNull() ?: return
+        // Own copy, cropped to the cover's shape (an inner picture is near-square).
+        val copy = fitToDisplay(pic) ?: return
         val config = DuoSettings.config.value
         val foldLine = { w: Float, h: Float, c: DuoConfig -> DuoShader.foldFor(false, w, h, c) }
         val s = SnapshotSurface(service, wm, copy, config, foldLine, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY)
@@ -443,11 +450,78 @@ class RearCoverEngine(
         f.tauS = if (hinge.externalActive) TiltFollower.FOLLOW_TAU_S else TiltFollower.DEFAULT_TAU_S
         f.follow { now -> tiltFor(hinge.estimate(now)) }
         follower = f
+        handler.postDelayed(liveTick, LIVE_INTERVAL_MS)
         Log.i(HTAG, "rear cover ${display.displayId}: showing ${if (pic === cover) "cover" else "inner"} picture ${copy.width}x${copy.height} (${age} ms old) at tilt=$start")
+    }
+
+    /**
+     * The cover shows nothing by itself while both panels are lit, so keep
+     * mirroring display 0 (the inner panel by then: the same app that is on
+     * its way to or from the cover) through Shizuku, cropped to the cover's
+     * shape, under the frost. Skips black frames of a panel still waking.
+     */
+    private fun liveFrame() {
+        if (destroyed || surface == null) return
+        if (liveBusy || !ShizukuBridge.ready) {
+            handler.postDelayed(liveTick, LIVE_INTERVAL_MS)
+            return
+        }
+        liveBusy = true
+        val excluded = runCatching { excludedOnDefault() }.getOrDefault(emptyList())
+        liveWorker.execute {
+            val frame = runCatching {
+                ShizukuBridge.capture(Display.DEFAULT_DISPLAY, excluded, LIVE_SCALE)?.let { fitToDisplay(it, skipBlack = true) }
+            }.getOrNull()
+            handler.post {
+                liveBusy = false
+                val s = surface
+                if (destroyed || s == null) return@post
+                if (frame != null) {
+                    s.replaceSnapshot(frame)
+                    liveFrames++
+                    if (liveFrames == 1 || liveFrames % 25 == 0) {
+                        Log.i(HTAG, "rear cover ${display.displayId}: live frame $liveFrames (${frame.width}x${frame.height})")
+                    }
+                }
+                handler.postDelayed(liveTick, LIVE_INTERVAL_MS)
+            }
+        }
+    }
+
+    /** Software copy center-cropped to this display's aspect; null if unusable (or black, with [skipBlack]). */
+    private fun fitToDisplay(src: Bitmap, skipBlack: Boolean = false): Bitmap? {
+        val sw = runCatching { src.copy(Bitmap.Config.ARGB_8888, false) }.getOrNull() ?: return null
+        if (skipBlack && isMostlyBlack(sw)) {
+            sw.recycle()
+            return null
+        }
+        val mode = runCatching { display.mode }.getOrNull() ?: return sw
+        val target = mode.physicalWidth.toFloat() / mode.physicalHeight.toFloat()
+        val have = sw.width.toFloat() / sw.height.toFloat()
+        if (kotlin.math.abs(have - target) < 0.02f) return sw
+        val (cw, ch) = if (have > target) {
+            (sw.height * target).toInt().coerceAtLeast(1) to sw.height
+        } else {
+            sw.width to (sw.width / target).toInt().coerceAtLeast(1)
+        }
+        val cropped = Bitmap.createBitmap(sw, (sw.width - cw) / 2, (sw.height - ch) / 2, cw, ch)
+        if (cropped !== sw) sw.recycle()
+        return cropped
+    }
+
+    private fun isMostlyBlack(b: Bitmap): Boolean {
+        val n = 16
+        var max = 0
+        for (iy in 0 until n) for (ix in 0 until n) {
+            val c = b.getPixel(((ix + 0.5f) * b.width / n).toInt(), ((iy + 0.5f) * b.height / n).toInt())
+            max = maxOf(max, ((c shr 16) and 0xFF) + ((c shr 8) and 0xFF) + (c and 0xFF))
+        }
+        return max < 30
     }
 
     fun destroy() {
         destroyed = true
+        handler.removeCallbacks(liveTick)
         handler.removeCallbacks(showRunnable)
         follower?.cancel()
         follower = null
@@ -460,5 +534,8 @@ class RearCoverEngine(
         const val FRESH_MS = 4_000L
         const val WAIT_TRIES = 15
         const val WAIT_STEP_MS = 40L
+        const val LIVE_INTERVAL_MS = 80L
+        const val LIVE_SCALE = 0.4f
+        val liveWorker = Executors.newSingleThreadExecutor()
     }
 }

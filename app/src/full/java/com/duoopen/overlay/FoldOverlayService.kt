@@ -190,7 +190,9 @@ class FoldOverlayService : AccessibilityService() {
         for ((id, display) in rear) {
             if (id !in rearEngines) {
                 Log.i(TAG, "rear cover display $id lit")
-                rearEngines[id] = RearCoverEngine(this, display, hinge, handler, snapshots)
+                rearEngines[id] = RearCoverEngine(this, display, hinge, handler, snapshots) {
+                    engines[Display.DEFAULT_DISPLAY]?.excludedLayers().orEmpty()
+                }
             }
         }
 

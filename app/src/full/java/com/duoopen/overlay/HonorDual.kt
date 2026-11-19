@@ -305,8 +305,13 @@ class HonorScreens(
         handler.removeCallbacks(dualTimeout)
         handler.removeCallbacks(shutGuess)
         if (next == Target.DUAL) handler.postDelayed(dualTimeout, DUAL_MAX_MS)
+        // The cover picture is grabbed alongside, never ahead of, the switch:
+        // a capture taken as the panels swap can take ~0.5 s, and every ms
+        // before the dual request reaches MagicOS is black on the cover.
+        if (next == Target.DUAL) {
+            snapshotWorker.execute { runCatching(snapshotBeforeDual).onFailure { Log.w(HTAG, "cover snapshot failed", it) } }
+        }
         HonorShell.run(
-            before = if (next == Target.DUAL) snapshotBeforeDual else null,
             cmd = when (next) {
                 Target.COVER -> "cmd device_state base-state $CLOSED_STATE" +
                     (if (prev == Target.DUAL) "; cmd device_state state reset" else "")
@@ -379,6 +384,7 @@ class HonorScreens(
         private const val DUAL_MAX_MS = 15_000L
         private const val SHUT_GUESS_MS = 500L
         private const val SHUT_DEG = 2f
+        private val snapshotWorker = Executors.newSingleThreadExecutor()
         private const val DUAL_RETRIES = 30
         private val ALL_ANIM_KEYS = listOf(
             Settings.Global.TRANSITION_ANIMATION_SCALE,

@@ -31,6 +31,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.runtime.rememberCoroutineScope
+import kotlinx.coroutines.launch
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.unit.dp
 import com.duoopen.fold.HingeAngleSource
@@ -81,6 +84,8 @@ fun ControlSheet(
     onDismiss: () -> Unit,
 ) {
     val clipboard = LocalClipboardManager.current
+    val context = LocalContext.current
+    val logScope = rememberCoroutineScope()
     val hasSensor = hinge.sensor != null
     // The sensor line isn't Compose state; poll it while the sheet is up.
     val sensorStatus by produceState(hinge.statusText(), hinge) {
@@ -373,6 +378,23 @@ fun ControlSheet(
                 }
                 TextButton(onClick = { HingeProfile.reset() }) {
                     Text("Forget learned angles")
+                }
+            }
+
+            // 8. Debug log ----------------------------------------------------
+            Divider()
+            Section(
+                "Debug log",
+                "Open and close the phone once, then share the log (no computer or adb needed). " +
+                    "It holds only Duo Open's own messages and your phone model.",
+            )
+            Row {
+                Button(onClick = { logScope.launch { DebugLog.share(context, DebugLog.collect(context)) } }) {
+                    Text("Share debug log")
+                }
+                Spacer(Modifier.padding(horizontal = 6.dp))
+                OutlinedButton(onClick = { logScope.launch { clipboard.setText(AnnotatedString(DebugLog.collect(context))) } }) {
+                    Text("Copy")
                 }
             }
         }

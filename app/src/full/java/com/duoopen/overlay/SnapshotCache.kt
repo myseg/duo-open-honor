@@ -28,10 +28,14 @@ class SnapshotCache(private val maxAgeMs: Long) {
         return b
     }
 
-    /** The latest picture of this panel kind whatever its size (Honor rear cover), or null. */
-    fun latest(innerPanel: Boolean): Bitmap? {
+    /**
+     * The latest picture of this panel kind whatever its size (Honor rear
+     * cover), or null. [anyAge]: a stale picture under heavy frost still
+     * beats a black panel.
+     */
+    fun latest(innerPanel: Boolean, anyAge: Boolean = false): Bitmap? {
         val e = entries[innerPanel] ?: return null
-        if (e.bitmap.isRecycled || SystemClock.uptimeMillis() - e.at > maxAgeMs) return null
+        if (e.bitmap.isRecycled || (!anyAge && SystemClock.uptimeMillis() - e.at > maxAgeMs)) return null
         return e.bitmap
     }
 

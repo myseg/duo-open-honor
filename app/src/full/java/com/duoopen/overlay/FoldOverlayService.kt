@@ -16,6 +16,7 @@ import android.view.Display
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityManager
 import com.duoopen.fold.HingeAngleSource
+import com.duoopen.fold.isInnerPanel
 import com.duoopen.fold.isLivePanel
 import com.duoopen.settings.DuoSettings
 import com.duoopen.shell.ShizukuBridge
@@ -91,13 +92,13 @@ class FoldOverlayService : AccessibilityService() {
         }
         ShizukuBridge.init(this)
         angleFeed = SamsungAngleFeed(this, handler, hinge)
-        scope.launch { ShizukuBridge.state.collect { syncAngleFeed() } }
+        scope.launch { ShizukuBridge.state.collect { syncAngleFeed(); honor?.onShizukuChanged() } }
         scope.launch { DuoSettings.config.collect { syncAngleFeed() } }
         syncDisplays()
         // Device-state numbers and the cover-as-rear-display trick are MagicOS
         // specific: never send them to another maker's phone.
         if (HonorScreens.isHonor()) {
-            honor = HonorScreens(this, handler, ::onHonorSwitch).also { it.start() }
+            honor = HonorScreens(this, handler, ::onHonorSwitch, ::snapshotDefaultDisplay).also { it.start() }
         }
         Log.i(TAG, "connected; hinge=${hinge.sensor?.name} posture=${deviceState?.active} live displays=${engines.keys}")
     }
@@ -132,6 +133,22 @@ class FoldOverlayService : AccessibilityService() {
     /** The cover display appears / disappears a moment after a screen switch; keep checking briefly. */
     private fun onHonorSwitch() {
         for (i in 1..12) handler.postDelayed({ syncDisplays() }, i * 60L)
+    }
+
+    /**
+     * Honor, background thread, just before both panels light: keep what
+     * display 0 shows (cover when opening, inner when closing) for the cover,
+     * which shows nothing by itself while both are lit.
+     */
+    private fun snapshotDefaultDisplay() {
+        if (!ShizukuBridge.ready) return
+        val display = displayManager.getDisplay(Display.DEFAULT_DISPLAY) ?: return
+        val inner = display.isInnerPanel()
+        val bitmap = ShizukuBridge.capture(Display.DEFAULT_DISPLAY, emptyList(), HONOR_SNAPSHOT_SCALE) ?: return
+        handler.post {
+            snapshots.put(inner, bitmap)
+            Log.i(TAG, "honor: kept a ${if (inner) "inner" else "cover"} picture ${bitmap.width}x${bitmap.height} for the cover")
+        }
     }
 
     /** Starts engines for panels that lit up, stops those that went dark, then lets each re-evaluate. */
@@ -201,7 +218,9 @@ class FoldOverlayService : AccessibilityService() {
     /** Samsung continuous angle via Shizuku (sensor HAL log, plus the fold wallpaper when it's set). */
     private fun syncAngleFeed() {
         val feed = angleFeed ?: return
-        val want = DuoSettings.config.value.shizukuAngle && ShizukuBridge.ready
+        // Samsung's sensor log only exists on Samsung phones.
+        val want = DuoSettings.config.value.shizukuAngle && ShizukuBridge.ready &&
+            android.os.Build.MANUFACTURER.equals("samsung", ignoreCase = true)
         if (want && !feed.active) feed.start() else if (!want && feed.active) feed.stop()
     }
 
@@ -222,6 +241,7 @@ class FoldOverlayService : AccessibilityService() {
         private const val TAG = "DuoOverlay"
         const val ACTION_DEMO = "com.duoopen.DEMO"
         private const val TEST_DISPLAYS_SETTING = "duoopen_test_displays"
+        private const val HONOR_SNAPSHOT_SCALE = 0.5f
         private const val CATEGORY_REAR = "android.hardware.display.category.REAR"
 
         /** How old a panel's last picture may be and still bridge the next fold. */

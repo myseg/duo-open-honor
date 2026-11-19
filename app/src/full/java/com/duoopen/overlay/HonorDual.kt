@@ -41,8 +41,9 @@ private object HonorShell {
         false
     }
 
-    fun run(cmd: String) {
+    fun run(cmd: String, before: (() -> Unit)? = null) {
         worker.execute {
+            before?.let { runCatching(it).onFailure { e -> Log.w(HTAG, "pre-step failed", e) } }
             try {
                 val m = Shizuku::class.java.getDeclaredMethod(
                     "newProcess",
@@ -75,6 +76,12 @@ class HonorScreens(
     private val context: Context,
     private val handler: Handler,
     private val onSwitch: () -> Unit,
+    /**
+     * Called on a background thread just before both panels light: grab what
+     * display 0 shows now, because the cover shows nothing by itself once
+     * both are lit and needs a picture to frost (live blur takes none).
+     */
+    private val snapshotBeforeDual: () -> Unit = {},
 ) : SensorEventListener {
 
     private enum class Target { NONE, COVER, DUAL }
@@ -157,6 +164,21 @@ class HonorScreens(
         handler.removeCallbacks(shutGuess)
         handler.removeCallbacks(restoreAnim)
         restoreAnimations()
+    }
+
+    /**
+     * Shizuku came up or was authorised: set up now and arm the cover if the
+     * phone is shut, instead of waiting for the hinge to move (by then
+     * MagicOS has already swapped panels, ~5° into an open).
+     */
+    fun onShizukuChanged() {
+        handler.post {
+            if (!started || !HonorShell.ready()) return@post
+            if (!setupDone) setup()
+            warnedNoShell = false
+            listen()
+            evaluate()
+        }
     }
 
     /** Clear any override a previous run left behind, and grant what the switch and the cover need. */
@@ -261,10 +283,14 @@ class HonorScreens(
         handler.removeCallbacks(shutGuess)
         if (next == Target.DUAL) handler.postDelayed(dualTimeout, DUAL_MAX_MS)
         HonorShell.run(
-            when (next) {
+            before = if (next == Target.DUAL) snapshotBeforeDual else null,
+            cmd = when (next) {
                 Target.COVER -> "cmd device_state base-state $CLOSED_STATE" +
                     (if (prev == Target.DUAL) "; cmd device_state state reset" else "")
-                Target.DUAL -> "cmd device_state state $DUAL_STATE"
+                // MagicOS refuses the dual state ("Please use it in expanded
+                // state") while the base state is overridden to CLOSED.
+                Target.DUAL -> (if (prev == Target.COVER) "cmd device_state base-state reset; " else "") +
+                    "cmd device_state state $DUAL_STATE"
                 Target.NONE -> RESET_ALL
             },
         )
@@ -374,19 +400,32 @@ class RearCoverEngine(
             Log.w(HTAG, "rear cover ${display.displayId}: no overlay permission yet (authorise Shizuku in Tune)")
             return
         }
-        val pic = cache.latest(innerPanel = false)
-        val age = cache.ageMs(false) ?: Long.MAX_VALUE
+        // Opening: display 0 was the cover until a moment ago, so the cover
+        // picture is fresh. Closing from open: the cover has nothing recent,
+        // but the inner screen was captured as both panels lit, and that's the
+        // app that's about to land on the cover.
+        val coverAge = cache.ageMs(false) ?: Long.MAX_VALUE
+        val innerAge = cache.ageMs(true) ?: Long.MAX_VALUE
+        val cover = cache.latest(innerPanel = false, anyAge = true)
+        val inner = cache.latest(innerPanel = true, anyAge = true)
         val waiting = tries < WAIT_TRIES
-        if (pic == null || (age > FRESH_MS && waiting)) {
-            // The cover's own capture of this fold may still be landing.
-            if (waiting) {
-                tries++
-                handler.postDelayed(showRunnable, WAIT_STEP_MS)
-            } else {
-                Log.w(HTAG, "rear cover ${display.displayId}: no cover picture to show")
-            }
+        val fresh = when {
+            cover != null && coverAge <= FRESH_MS -> cover
+            inner != null && innerAge <= FRESH_MS -> inner
+            else -> null
+        }
+        if (fresh == null && waiting) {
+            // The capture taken as both panels lit may still be landing.
+            tries++
+            handler.postDelayed(showRunnable, WAIT_STEP_MS)
             return
         }
+        val pic = fresh ?: cover ?: inner
+        if (pic == null) {
+            Log.w(HTAG, "rear cover ${display.displayId}: no picture to show")
+            return
+        }
+        val age = if (pic === cover) coverAge else innerAge
         // Own copy: the cache may hand the original to someone else.
         val copy = runCatching { pic.copy(pic.config ?: Bitmap.Config.ARGB_8888, false) }.getOrNull() ?: return
         val config = DuoSettings.config.value
@@ -404,7 +443,7 @@ class RearCoverEngine(
         f.tauS = if (hinge.externalActive) TiltFollower.FOLLOW_TAU_S else TiltFollower.DEFAULT_TAU_S
         f.follow { now -> tiltFor(hinge.estimate(now)) }
         follower = f
-        Log.i(HTAG, "rear cover ${display.displayId}: showing ${copy.width}x${copy.height} (${age} ms old) at tilt=$start")
+        Log.i(HTAG, "rear cover ${display.displayId}: showing ${if (pic === cover) "cover" else "inner"} picture ${copy.width}x${copy.height} (${age} ms old) at tilt=$start")
     }
 
     fun destroy() {

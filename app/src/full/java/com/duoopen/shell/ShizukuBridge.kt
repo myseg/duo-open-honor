@@ -9,7 +9,7 @@ import android.os.Binder
 import android.os.Bundle
 import android.os.IBinder
 import android.os.Parcel
-import android.util.Log
+import com.duoopen.Log
 import android.view.SurfaceControl
 import com.duoopen.BuildConfig
 import kotlinx.coroutines.flow.MutableStateFlow

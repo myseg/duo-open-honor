@@ -8,7 +8,7 @@ import android.graphics.Paint
 import android.graphics.RuntimeShader
 import android.graphics.Shader
 import android.service.wallpaper.WallpaperService
-import android.util.Log
+import com.duoopen.Log
 import android.view.SurfaceHolder
 import com.duoopen.fold.DuoShader
 import com.duoopen.fold.HingeAngleSource

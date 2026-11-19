@@ -3,8 +3,10 @@ package com.duoopen.ui
 import android.content.Context
 import android.content.Intent
 import android.hardware.display.DisplayManager
+import android.content.pm.PackageManager
 import android.os.Build
-import android.os.Process
+import android.provider.Settings
+import com.duoopen.Log
 import android.widget.Toast
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -15,10 +17,6 @@ import kotlinx.coroutines.withContext
  * to the share sheet — for bug reports from people without a computer.
  */
 object DebugLog {
-    private val TAGS = listOf(
-        "DuoOverlay", "DuoHonor", "DuoHinge", "DuoDeviceState", "DuoDual",
-        "DuoShizuku", "DuoAngleFeed", "DuoShader", "DuoWallpaper",
-    )
     private const val MAX_LINES = 3_000
 
     suspend fun collect(context: Context): String = withContext(Dispatchers.IO) {
@@ -29,22 +27,29 @@ object DebugLog {
             val app = runCatching { context.packageManager.getPackageInfo(context.packageName, 0).versionName }.getOrNull()
             appendLine("App: ${context.packageName} $app")
             val dm = context.getSystemService(DisplayManager::class.java)
-            for (d in dm?.displays.orEmpty()) {
+            val listed = dm?.displays.orEmpty().associateBy { it.displayId }
+            val all = LinkedHashMap(listed)
+            runCatching { dm?.getDisplays("android.hardware.display.category.REAR")?.forEach { all[it.displayId] = it } }
+            for (id in 1..8) if (id !in all) runCatching { dm?.getDisplay(id) }.getOrNull()?.let { all[id] = it }
+            for (d in all.values) {
                 val m = d.mode
-                appendLine("Display ${d.displayId} \"${d.name}\" ${m.physicalWidth}x${m.physicalHeight} state=${d.state} flags=0x${Integer.toHexString(d.flags)}")
+                val hidden = if (d.displayId in listed) "" else " (hidden)"
+                appendLine("Display ${d.displayId}$hidden \"${d.name}\" ${m.physicalWidth}x${m.physicalHeight} state=${d.state} flags=0x${Integer.toHexString(d.flags)}")
             }
+            val cr = context.contentResolver
+            for (k in listOf("duoopen_honor_mode", "duoopen_honor_open_at", "duoopen_honor_close_at", "duoopen_honor_dual_from", "duoopen_honor_anim", "duoopen_honor_locked")) {
+                Settings.Global.getString(cr, k)?.let { appendLine("$k=$it") }
+            }
+            val enabled = Settings.Secure.getString(cr, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES).orEmpty()
+            appendLine("Accessibility service enabled: ${enabled.contains(context.packageName + "/")}")
+            appendLine("Overlay permission: ${Settings.canDrawOverlays(context)}")
+            appendLine("Secure settings permission: ${context.checkSelfPermission("android.permission.WRITE_SECURE_SETTINGS") == PackageManager.PERMISSION_GRANTED}")
+            appendLine("Shizuku package installed: ${runCatching { context.packageManager.getPackageInfo("moe.shizuku.privileged.api", 0); true }.getOrDefault(false)}")
             appendLine()
         }
-        val cmd = mutableListOf("logcat", "-d", "-v", "time", "--pid=${Process.myPid()}", "-s")
-        cmd += TAGS
-        val lines = runCatching {
-            val p = ProcessBuilder(cmd).redirectErrorStream(true).start()
-            val out = p.inputStream.bufferedReader().readLines()
-            p.waitFor()
-            out
-        }.getOrElse { listOf("Couldn't read the log: ${it.message}") }
-        val body = lines.takeLast(MAX_LINES).joinToString("\n")
-        header + body.ifBlank { "(no log lines yet — enable the service, open and close the phone, then try again)" }
+        // The app's own copy: MagicOS hides third-party logcat output.
+        val body = Log.dump().takeLast(MAX_LINES).joinToString("\n")
+        header + body.ifBlank { "(no log lines yet — check that Duo Open's accessibility service is on, open and close the phone, then try again)" }
     }
 
     fun share(context: Context, text: String) {

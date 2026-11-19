@@ -8,7 +8,7 @@ import android.hardware.display.DisplayManager
 import android.os.Handler
 import android.os.PowerManager
 import android.os.SystemClock
-import android.util.Log
+import com.duoopen.Log
 import android.view.Display
 import android.view.Gravity
 import android.view.View

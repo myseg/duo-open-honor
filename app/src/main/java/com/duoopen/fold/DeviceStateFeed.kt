@@ -1,7 +1,7 @@
 package com.duoopen.fold
 
 import android.content.Context
-import android.util.Log
+import com.duoopen.Log
 import java.lang.reflect.Proxy
 import java.util.concurrent.Executor
 

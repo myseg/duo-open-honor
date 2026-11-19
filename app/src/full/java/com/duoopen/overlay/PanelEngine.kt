@@ -4,7 +4,7 @@ import android.accessibilityservice.AccessibilityService
 import android.graphics.Bitmap
 import android.os.Handler
 import android.os.SystemClock
-import android.util.Log
+import com.duoopen.Log
 import android.view.Display
 import android.view.WindowManager
 import com.duoopen.fold.DuoShader

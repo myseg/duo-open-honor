@@ -7,7 +7,7 @@ import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.os.Build
 import android.os.SystemClock
-import android.util.Log
+import com.duoopen.Log
 import kotlin.math.abs
 import kotlin.math.roundToInt
 

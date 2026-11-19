@@ -2,7 +2,7 @@ package com.duoopen.fold
 
 import android.content.Context
 import android.graphics.RuntimeShader
-import android.util.Log
+import com.duoopen.Log
 import com.duoopen.R
 import com.duoopen.settings.DuoConfig
 
